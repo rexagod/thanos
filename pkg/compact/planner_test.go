@@ -800,7 +800,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 			t.Run("from meta", func(t *testing.T) {
 				obj := bkt.Objects()
 				for o := range obj {
-					testutil.Ok(t, bkt.Delete(context.Background(), o))
+					delete(obj, o)
 				}
 
 				metasByMinTime := make([]*metadata.Meta, len(c.metas))
@@ -828,7 +828,7 @@ func TestLargeTotalIndexSizeFilter_Plan(t *testing.T) {
 			t.Run("from bkt", func(t *testing.T) {
 				obj := bkt.Objects()
 				for o := range obj {
-					testutil.Ok(t, bkt.Delete(context.Background(), o))
+					delete(obj, o)
 				}
 
 				metasByMinTime := make([]*metadata.Meta, len(c.metas))

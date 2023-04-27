@@ -11,7 +11,6 @@ import (
 	"sort"
 	"sync"
 
-	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql/parser"
 	"golang.org/x/exp/slices"
@@ -100,8 +99,8 @@ func (a *kAggregate) Next(ctx context.Context) ([]model.StepVector, error) {
 	}
 	a.paramOp.GetPool().PutVectors(args)
 
-	if len(args) < len(in) {
-		return nil, errors.New("scalar argument not found")
+	if len(args) != len(in) {
+		return nil, fmt.Errorf("scalar argument not found")
 	}
 
 	a.once.Do(func() { err = a.init(ctx) })
@@ -187,7 +186,8 @@ func (a *kAggregate) aggregate(t int64, result *[]model.StepVector, k int, Sampl
 		}
 
 		for _, e := range h.entries {
-			s.AppendSample(a.vectorPool, e.sId, e.total)
+			s.SampleIDs = append(s.SampleIDs, e.sId)
+			s.Samples = append(s.Samples, e.total)
 		}
 		*result = append(*result, s)
 		h.entries = h.entries[:0]

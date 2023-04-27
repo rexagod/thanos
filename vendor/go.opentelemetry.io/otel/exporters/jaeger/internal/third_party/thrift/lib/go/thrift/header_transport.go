@@ -28,6 +28,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 )
 
 // Size in bytes for 32-bit ints.
@@ -373,7 +374,7 @@ func (t *THeaderTransport) ReadFrame(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	t.frameReader = io.NopCloser(&t.frameBuffer)
+	t.frameReader = ioutil.NopCloser(&t.frameBuffer)
 
 	// Peek and handle the next 32 bits.
 	buf = t.frameBuffer.Bytes()[:size32]

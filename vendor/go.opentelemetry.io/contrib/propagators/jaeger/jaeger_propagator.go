@@ -28,10 +28,11 @@ import (
 const (
 	jaegerHeader        = "uber-trace-id"
 	separator           = ":"
+	traceID64bitsWidth  = 64 / 4
 	traceID128bitsWidth = 128 / 4
 	spanIDWidth         = 64 / 4
 
-	idPaddingChar = "0"
+	traceIDPadding = "0000000000000000"
 
 	flagsDebug      = 0x02
 	flagsSampled    = 0x01
@@ -107,13 +108,12 @@ func extract(ctx context.Context, headerVal string) (context.Context, trace.Span
 	// extract trace ID
 	if parts[0] != "" {
 		id := parts[0]
-		if len(id) > traceID128bitsWidth {
+		if len(id) != traceID128bitsWidth && len(id) != traceID64bitsWidth {
 			return ctx, empty, errInvalidTraceIDLength
 		}
-		// padding when length is less than 32
-		if len(id) < traceID128bitsWidth {
-			padCharCount := traceID128bitsWidth - len(id)
-			id = strings.Repeat(idPaddingChar, padCharCount) + id
+		// padding when length is 16
+		if len(id) == traceID64bitsWidth {
+			id = traceIDPadding + id
 		}
 		scc.TraceID, err = trace.TraceIDFromHex(id)
 		if err != nil {
@@ -124,13 +124,8 @@ func extract(ctx context.Context, headerVal string) (context.Context, trace.Span
 	// extract span ID
 	if parts[1] != "" {
 		id := parts[1]
-		if len(id) > spanIDWidth {
+		if len(id) != spanIDWidth {
 			return ctx, empty, errInvalidSpanIDLength
-		}
-		// padding when length is less than 16
-		if len(id) < spanIDWidth {
-			padCharCount := spanIDWidth - len(id)
-			id = strings.Repeat(idPaddingChar, padCharCount) + id
 		}
 		scc.SpanID, err = trace.SpanIDFromHex(id)
 		if err != nil {

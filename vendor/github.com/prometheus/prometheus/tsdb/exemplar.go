@@ -226,16 +226,13 @@ func (ce *CircularExemplarStorage) validateExemplar(key []byte, e exemplar.Exemp
 	// Exemplar label length does not include chars involved in text rendering such as quotes
 	// equals sign, or commas. See definition of const ExemplarMaxLabelLength.
 	labelSetLen := 0
-	if err := e.Labels.Validate(func(l labels.Label) error {
+	for _, l := range e.Labels {
 		labelSetLen += utf8.RuneCountInString(l.Name)
 		labelSetLen += utf8.RuneCountInString(l.Value)
 
 		if labelSetLen > exemplar.ExemplarMaxLabelSetLength {
 			return storage.ErrExemplarLabelLength
 		}
-		return nil
-	}); err != nil {
-		return err
 	}
 
 	idx, ok := ce.index[string(key)]

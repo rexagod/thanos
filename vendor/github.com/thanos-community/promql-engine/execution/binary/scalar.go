@@ -36,12 +36,6 @@ type scalarOperator struct {
 	operandValIdx int
 	operation     operation
 	opType        parser.ItemType
-
-	// If true then return the comparison result as 0/1.
-	returnBool bool
-
-	// Keep the result if both sides are scalars.
-	bothScalars bool
 }
 
 func NewScalar(
@@ -50,7 +44,6 @@ func NewScalar(
 	scalar model.VectorOperator,
 	op parser.ItemType,
 	scalarSide ScalarSide,
-	returnBool bool,
 ) (*scalarOperator, error) {
 	binaryOperation, err := newOperation(op, scalarSide != ScalarSideBoth)
 	if err != nil {
@@ -73,8 +66,6 @@ func NewScalar(
 		opType:        op,
 		getOperands:   getOperands,
 		operandValIdx: operandValIdx,
-		returnBool:    returnBool,
-		bothScalars:   scalarSide == ScalarSideBoth,
 	}, nil
 }
 
@@ -126,17 +117,14 @@ func (o *scalarOperator) Next(ctx context.Context) ([]model.StepVector, error) {
 
 			operands := o.getOperands(vector, i, scalarVal)
 			val, keep := o.operation(operands, o.operandValIdx)
-			if o.returnBool {
-				if !o.bothScalars {
-					val = 0.0
-					if keep {
-						val = 1.0
-					}
-				}
-			} else if !keep {
+			if !keep {
 				continue
 			}
-			step.AppendSample(o.pool, vector.SampleIDs[i], val)
+			step.Samples = append(step.Samples, val)
+			step.SampleIDs = append(step.SampleIDs, vector.SampleIDs[i])
+		}
+		if len(step.Samples) == 0 {
+			continue
 		}
 		out = append(out, step)
 		o.next.GetPool().PutStepVector(vector)

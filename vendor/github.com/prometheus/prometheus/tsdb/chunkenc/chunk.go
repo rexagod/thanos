@@ -30,7 +30,6 @@ const (
 	EncNone Encoding = iota
 	EncXOR
 	EncHistogram
-	EncFloatHistogram
 )
 
 func (e Encoding) String() string {
@@ -41,8 +40,6 @@ func (e Encoding) String() string {
 		return "XOR"
 	case EncHistogram:
 		return "histogram"
-	case EncFloatHistogram:
-		return "floathistogram"
 	}
 	return "<unknown>"
 }
@@ -60,7 +57,7 @@ func IsOutOfOrderChunk(e Encoding) bool {
 
 // IsValidEncoding returns true for supported encodings.
 func IsValidEncoding(e Encoding) bool {
-	return e == EncXOR || e == EncOOOXOR || e == EncHistogram || e == EncFloatHistogram
+	return e == EncXOR || e == EncOOOXOR || e == EncHistogram
 }
 
 // Chunk holds a sequence of sample pairs that can be iterated over and appended to.
@@ -94,7 +91,6 @@ type Chunk interface {
 type Appender interface {
 	Append(int64, float64)
 	AppendHistogram(t int64, h *histogram.Histogram)
-	AppendFloatHistogram(t int64, h *histogram.FloatHistogram)
 }
 
 // Iterator is a simple iterator that can only get the next value.
@@ -163,8 +159,6 @@ func (v ValueType) ChunkEncoding() Encoding {
 		return EncXOR
 	case ValHistogram:
 		return EncHistogram
-	case ValFloatHistogram:
-		return EncFloatHistogram
 	default:
 		return EncNone
 	}
@@ -234,9 +228,8 @@ type Pool interface {
 
 // pool is a memory pool of chunk objects.
 type pool struct {
-	xor            sync.Pool
-	histogram      sync.Pool
-	floatHistogram sync.Pool
+	xor       sync.Pool
+	histogram sync.Pool
 }
 
 // NewPool returns a new pool.
@@ -252,11 +245,6 @@ func NewPool() Pool {
 				return &HistogramChunk{b: bstream{}}
 			},
 		},
-		floatHistogram: sync.Pool{
-			New: func() interface{} {
-				return &FloatHistogramChunk{b: bstream{}}
-			},
-		},
 	}
 }
 
@@ -269,11 +257,6 @@ func (p *pool) Get(e Encoding, b []byte) (Chunk, error) {
 		return c, nil
 	case EncHistogram:
 		c := p.histogram.Get().(*HistogramChunk)
-		c.b.stream = b
-		c.b.count = 0
-		return c, nil
-	case EncFloatHistogram:
-		c := p.floatHistogram.Get().(*FloatHistogramChunk)
 		c.b.stream = b
 		c.b.count = 0
 		return c, nil
@@ -305,17 +288,6 @@ func (p *pool) Put(c Chunk) error {
 		sh.b.stream = nil
 		sh.b.count = 0
 		p.histogram.Put(c)
-	case EncFloatHistogram:
-		sh, ok := c.(*FloatHistogramChunk)
-		// This may happen often with wrapped chunks. Nothing we can really do about
-		// it but returning an error would cause a lot of allocations again. Thus,
-		// we just skip it.
-		if !ok {
-			return nil
-		}
-		sh.b.stream = nil
-		sh.b.count = 0
-		p.floatHistogram.Put(c)
 	default:
 		return errors.Errorf("invalid chunk encoding %q", c.Encoding())
 	}
@@ -331,8 +303,6 @@ func FromData(e Encoding, d []byte) (Chunk, error) {
 		return &XORChunk{b: bstream{count: 0, stream: d}}, nil
 	case EncHistogram:
 		return &HistogramChunk{b: bstream{count: 0, stream: d}}, nil
-	case EncFloatHistogram:
-		return &FloatHistogramChunk{b: bstream{count: 0, stream: d}}, nil
 	}
 	return nil, errors.Errorf("invalid chunk encoding %q", e)
 }
@@ -344,8 +314,6 @@ func NewEmptyChunk(e Encoding) (Chunk, error) {
 		return NewXORChunk(), nil
 	case EncHistogram:
 		return NewHistogramChunk(), nil
-	case EncFloatHistogram:
-		return NewFloatHistogramChunk(), nil
 	}
 	return nil, errors.Errorf("invalid chunk encoding %q", e)
 }

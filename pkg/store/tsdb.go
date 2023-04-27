@@ -163,18 +163,10 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 	defer shardMatcher.Close()
 	hasher := hashPool.Get().(hash.Hash64)
 	defer hashPool.Put(hasher)
-
-	extLsetToRemove := map[string]struct{}{}
-	for _, lbl := range r.WithoutReplicaLabels {
-		extLsetToRemove[lbl] = struct{}{}
-	}
-
-	finalExtLset := rmLabels(s.extLset.Copy(), extLsetToRemove)
 	// Stream at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
 	for set.Next() {
 		series := set.At()
-
-		completeLabelset := labelpb.ExtendSortedLabels(rmLabels(series.Labels(), extLsetToRemove), finalExtLset)
+		completeLabelset := labelpb.ExtendSortedLabels(series.Labels(), s.extLset)
 		if !shardMatcher.MatchesLabels(completeLabelset) {
 			continue
 		}
@@ -194,7 +186,7 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 		frameBytesLeft := bytesLeftForChunks
 
 		seriesChunks := []storepb.AggrChunk{}
-		chIter := series.Iterator(nil)
+		chIter := series.Iterator()
 		isNext := chIter.Next()
 		for isNext {
 			chk := chIter.At()
@@ -202,15 +194,13 @@ func (s *TSDBStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSer
 				return status.Errorf(codes.Internal, "TSDBStore: found not populated chunk returned by SeriesSet at ref: %v", chk.Ref)
 			}
 
-			chunkBytes := make([]byte, len(chk.Chunk.Bytes()))
-			copy(chunkBytes, chk.Chunk.Bytes())
 			c := storepb.AggrChunk{
 				MinTime: chk.MinTime,
 				MaxTime: chk.MaxTime,
 				Raw: &storepb.Chunk{
 					Type: storepb.Chunk_Encoding(chk.Chunk.Encoding() - 1), // Proto chunk encoding is one off to TSDB one.
-					Data: chunkBytes,
-					Hash: hashChunk(hasher, chunkBytes, enableChunkHashCalculation),
+					Data: chk.Chunk.Bytes(),
+					Hash: hashChunk(hasher, chk.Chunk.Bytes(), enableChunkHashCalculation),
 				},
 			}
 			frameBytesLeft -= c.Size()

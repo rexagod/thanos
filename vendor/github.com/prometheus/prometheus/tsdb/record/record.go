@@ -17,6 +17,7 @@ package record
 
 import (
 	"math"
+	"sort"
 
 	"github.com/pkg/errors"
 
@@ -49,8 +50,6 @@ const (
 	Metadata Type = 6
 	// HistogramSamples is used to match WAL records of type Histograms.
 	HistogramSamples Type = 7
-	// FloatHistogramSamples is used to match WAL records of type Float Histograms.
-	FloatHistogramSamples Type = 8
 )
 
 func (rt Type) String() string {
@@ -65,8 +64,6 @@ func (rt Type) String() string {
 		return "exemplars"
 	case HistogramSamples:
 		return "histogram_samples"
-	case FloatHistogramSamples:
-		return "float_histogram_samples"
 	case MmapMarkers:
 		return "mmapmarkers"
 	case Metadata:
@@ -177,13 +174,6 @@ type RefHistogramSample struct {
 	H   *histogram.Histogram
 }
 
-// RefFloatHistogramSample is a float histogram.
-type RefFloatHistogramSample struct {
-	Ref chunks.HeadSeriesRef
-	T   int64
-	FH  *histogram.FloatHistogram
-}
-
 // RefMmapMarker marks that the all the samples of the given series until now have been m-mapped to disk.
 type RefMmapMarker struct {
 	Ref     chunks.HeadSeriesRef
@@ -192,9 +182,7 @@ type RefMmapMarker struct {
 
 // Decoder decodes series, sample, metadata and tombstone records.
 // The zero value is ready to use.
-type Decoder struct {
-	builder labels.ScratchBuilder
-}
+type Decoder struct{}
 
 // Type returns the type of the record.
 // Returns RecordUnknown if no valid record type is found.
@@ -203,7 +191,7 @@ func (d *Decoder) Type(rec []byte) Type {
 		return Unknown
 	}
 	switch t := Type(rec[0]); t {
-	case Series, Samples, Tombstones, Exemplars, MmapMarkers, Metadata, HistogramSamples, FloatHistogramSamples:
+	case Series, Samples, Tombstones, Exemplars, MmapMarkers, Metadata, HistogramSamples:
 		return t
 	}
 	return Unknown
@@ -279,15 +267,14 @@ func (d *Decoder) Metadata(rec []byte, metadata []RefMetadata) ([]RefMetadata, e
 
 // DecodeLabels decodes one set of labels from buf.
 func (d *Decoder) DecodeLabels(dec *encoding.Decbuf) labels.Labels {
-	// TODO: reconsider if this function could be pushed down into labels.Labels to be more efficient.
-	d.builder.Reset()
-	nLabels := dec.Uvarint()
-	for i := 0; i < nLabels; i++ {
-		lName := dec.UvarintStr()
-		lValue := dec.UvarintStr()
-		d.builder.Add(lName, lValue)
+	lset := make(labels.Labels, dec.Uvarint())
+
+	for i := range lset {
+		lset[i].Name = dec.UvarintStr()
+		lset[i].Value = dec.UvarintStr()
 	}
-	return d.builder.Labels()
+	sort.Sort(lset)
+	return lset
 }
 
 // Samples appends samples in rec to the given slice.
@@ -438,10 +425,14 @@ func (d *Decoder) HistogramSamples(rec []byte, histograms []RefHistogramSample) 
 		rh := RefHistogramSample{
 			Ref: chunks.HeadSeriesRef(baseRef + uint64(dref)),
 			T:   baseTime + dtime,
-			H:   &histogram.Histogram{},
+			H: &histogram.Histogram{
+				Schema:        0,
+				ZeroThreshold: 0,
+				ZeroCount:     0,
+				Count:         0,
+				Sum:           0,
+			},
 		}
-
-		rh.H.CounterResetHint = histogram.CounterResetHint(dec.Byte())
 
 		rh.H.Schema = int32(dec.Varint64())
 		rh.H.ZeroThreshold = math.Float64frombits(dec.Be64())
@@ -496,84 +487,6 @@ func (d *Decoder) HistogramSamples(rec []byte, histograms []RefHistogramSample) 
 	return histograms, nil
 }
 
-func (d *Decoder) FloatHistogramSamples(rec []byte, histograms []RefFloatHistogramSample) ([]RefFloatHistogramSample, error) {
-	dec := encoding.Decbuf{B: rec}
-	t := Type(dec.Byte())
-	if t != FloatHistogramSamples {
-		return nil, errors.New("invalid record type")
-	}
-	if dec.Len() == 0 {
-		return histograms, nil
-	}
-	var (
-		baseRef  = dec.Be64()
-		baseTime = dec.Be64int64()
-	)
-	for len(dec.B) > 0 && dec.Err() == nil {
-		dref := dec.Varint64()
-		dtime := dec.Varint64()
-
-		rh := RefFloatHistogramSample{
-			Ref: chunks.HeadSeriesRef(baseRef + uint64(dref)),
-			T:   baseTime + dtime,
-			FH:  &histogram.FloatHistogram{},
-		}
-
-		rh.FH.CounterResetHint = histogram.CounterResetHint(dec.Byte())
-
-		rh.FH.Schema = int32(dec.Varint64())
-		rh.FH.ZeroThreshold = dec.Be64Float64()
-
-		rh.FH.ZeroCount = dec.Be64Float64()
-		rh.FH.Count = dec.Be64Float64()
-		rh.FH.Sum = dec.Be64Float64()
-
-		l := dec.Uvarint()
-		if l > 0 {
-			rh.FH.PositiveSpans = make([]histogram.Span, l)
-		}
-		for i := range rh.FH.PositiveSpans {
-			rh.FH.PositiveSpans[i].Offset = int32(dec.Varint64())
-			rh.FH.PositiveSpans[i].Length = dec.Uvarint32()
-		}
-
-		l = dec.Uvarint()
-		if l > 0 {
-			rh.FH.NegativeSpans = make([]histogram.Span, l)
-		}
-		for i := range rh.FH.NegativeSpans {
-			rh.FH.NegativeSpans[i].Offset = int32(dec.Varint64())
-			rh.FH.NegativeSpans[i].Length = dec.Uvarint32()
-		}
-
-		l = dec.Uvarint()
-		if l > 0 {
-			rh.FH.PositiveBuckets = make([]float64, l)
-		}
-		for i := range rh.FH.PositiveBuckets {
-			rh.FH.PositiveBuckets[i] = dec.Be64Float64()
-		}
-
-		l = dec.Uvarint()
-		if l > 0 {
-			rh.FH.NegativeBuckets = make([]float64, l)
-		}
-		for i := range rh.FH.NegativeBuckets {
-			rh.FH.NegativeBuckets[i] = dec.Be64Float64()
-		}
-
-		histograms = append(histograms, rh)
-	}
-
-	if dec.Err() != nil {
-		return nil, errors.Wrapf(dec.Err(), "decode error after %d histograms", len(histograms))
-	}
-	if len(dec.B) > 0 {
-		return nil, errors.Errorf("unexpected %d bytes left in entry", len(dec.B))
-	}
-	return histograms, nil
-}
-
 // Encoder encodes series, sample, and tombstones records.
 // The zero value is ready to use.
 type Encoder struct{}
@@ -612,13 +525,12 @@ func (e *Encoder) Metadata(metadata []RefMetadata, b []byte) []byte {
 
 // EncodeLabels encodes the contents of labels into buf.
 func EncodeLabels(buf *encoding.Encbuf, lbls labels.Labels) {
-	// TODO: reconsider if this function could be pushed down into labels.Labels to be more efficient.
-	buf.PutUvarint(lbls.Len())
+	buf.PutUvarint(len(lbls))
 
-	lbls.Range(func(l labels.Label) {
+	for _, l := range lbls {
 		buf.PutUvarintStr(l.Name)
 		buf.PutUvarintStr(l.Value)
-	})
+	}
 }
 
 // Samples appends the encoded samples to b and returns the resulting slice.
@@ -719,8 +631,6 @@ func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) []
 		buf.PutVarint64(int64(h.Ref) - int64(first.Ref))
 		buf.PutVarint64(h.T - first.T)
 
-		buf.PutByte(byte(h.H.CounterResetHint))
-
 		buf.PutVarint64(int64(h.H.Schema))
 		buf.PutBE64(math.Float64bits(h.H.ZeroThreshold))
 
@@ -748,59 +658,6 @@ func (e *Encoder) HistogramSamples(histograms []RefHistogramSample, b []byte) []
 		buf.PutUvarint(len(h.H.NegativeBuckets))
 		for _, b := range h.H.NegativeBuckets {
 			buf.PutVarint64(b)
-		}
-	}
-
-	return buf.Get()
-}
-
-func (e *Encoder) FloatHistogramSamples(histograms []RefFloatHistogramSample, b []byte) []byte {
-	buf := encoding.Encbuf{B: b}
-	buf.PutByte(byte(FloatHistogramSamples))
-
-	if len(histograms) == 0 {
-		return buf.Get()
-	}
-
-	// Store base timestamp and base reference number of first histogram.
-	// All histograms encode their timestamp and ref as delta to those.
-	first := histograms[0]
-	buf.PutBE64(uint64(first.Ref))
-	buf.PutBE64int64(first.T)
-
-	for _, h := range histograms {
-		buf.PutVarint64(int64(h.Ref) - int64(first.Ref))
-		buf.PutVarint64(h.T - first.T)
-
-		buf.PutByte(byte(h.FH.CounterResetHint))
-
-		buf.PutVarint64(int64(h.FH.Schema))
-		buf.PutBEFloat64(h.FH.ZeroThreshold)
-
-		buf.PutBEFloat64(h.FH.ZeroCount)
-		buf.PutBEFloat64(h.FH.Count)
-		buf.PutBEFloat64(h.FH.Sum)
-
-		buf.PutUvarint(len(h.FH.PositiveSpans))
-		for _, s := range h.FH.PositiveSpans {
-			buf.PutVarint64(int64(s.Offset))
-			buf.PutUvarint32(s.Length)
-		}
-
-		buf.PutUvarint(len(h.FH.NegativeSpans))
-		for _, s := range h.FH.NegativeSpans {
-			buf.PutVarint64(int64(s.Offset))
-			buf.PutUvarint32(s.Length)
-		}
-
-		buf.PutUvarint(len(h.FH.PositiveBuckets))
-		for _, b := range h.FH.PositiveBuckets {
-			buf.PutBEFloat64(b)
-		}
-
-		buf.PutUvarint(len(h.FH.NegativeBuckets))
-		for _, b := range h.FH.NegativeBuckets {
-			buf.PutBEFloat64(b)
 		}
 	}
 

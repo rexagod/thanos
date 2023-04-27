@@ -17,6 +17,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 )
 
@@ -50,14 +51,13 @@ func ReadLabels(fn string, n int) ([]Labels, error) {
 	defer f.Close()
 
 	scanner := bufio.NewScanner(f)
-	b := ScratchBuilder{}
 
 	var mets []Labels
 	hashes := map[uint64]struct{}{}
 	i := 0
 
 	for scanner.Scan() && i < n {
-		b.Reset()
+		m := make(Labels, 0, 10)
 
 		r := strings.NewReplacer("\"", "", "{", "", "}", "")
 		s := r.Replace(scanner.Text())
@@ -65,11 +65,10 @@ func ReadLabels(fn string, n int) ([]Labels, error) {
 		labelChunks := strings.Split(s, ",")
 		for _, labelChunk := range labelChunks {
 			split := strings.Split(labelChunk, ":")
-			b.Add(split[0], split[1])
+			m = append(m, Label{Name: split[0], Value: split[1]})
 		}
 		// Order of the k/v labels matters, don't assume we'll always receive them already sorted.
-		b.Sort()
-		m := b.Labels()
+		sort.Sort(m)
 
 		h := m.Hash()
 		if _, ok := hashes[h]; ok {

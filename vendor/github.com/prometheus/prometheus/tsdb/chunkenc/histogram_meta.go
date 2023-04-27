@@ -19,10 +19,7 @@ import (
 	"github.com/prometheus/prometheus/model/histogram"
 )
 
-func writeHistogramChunkLayout(
-	b *bstream, schema int32, zeroThreshold float64,
-	positiveSpans, negativeSpans []histogram.Span,
-) {
+func writeHistogramChunkLayout(b *bstream, schema int32, zeroThreshold float64, positiveSpans, negativeSpans []histogram.Span) {
 	putZeroThreshold(b, zeroThreshold)
 	putVarbitInt(b, int64(schema))
 	putHistogramChunkLayoutSpans(b, positiveSpans)
@@ -94,7 +91,9 @@ func readHistogramChunkLayoutSpans(b *bstreamReader) ([]histogram.Span, error) {
 
 // putZeroThreshold writes the zero threshold to the bstream. It stores typical
 // values in just one byte, but needs 9 bytes for other values. In detail:
-//   - If the threshold is 0, store a single zero byte.
+//
+// * If the threshold is 0, store a single zero byte.
+//
 //   - If the threshold is a power of 2 between (and including) 2^-243 and 2^10,
 //     take the exponent from the IEEE 754 representation of the threshold, which
 //     covers a range between (and including) -242 and 11. (2^-243 is 0.5*2^-242
@@ -104,6 +103,7 @@ func readHistogramChunkLayoutSpans(b *bstreamReader) ([]histogram.Span, error) {
 //     threshold. The default value for the zero threshold is 2^-128 (or
 //     0.5*2^-127 in IEEE 754 representation) and will therefore be encoded as a
 //     single byte (with value 116).
+//
 //   - In all other cases, store 255 as a single byte, followed by the 8 bytes of
 //     the threshold as a float64, i.e. taking 9 bytes in total.
 func putZeroThreshold(b *bstream, threshold float64) {
@@ -165,37 +165,35 @@ func (b *bucketIterator) Next() (int, bool) {
 	if b.span >= len(b.spans) {
 		return 0, false
 	}
-	if b.bucket < int(b.spans[b.span].Length)-1 { // Try to move within same span.
+try:
+	if b.bucket < int(b.spans[b.span].Length-1) { // Try to move within same span.
 		b.bucket++
 		b.idx++
 		return b.idx, true
-	}
-
-	for b.span < len(b.spans)-1 { // Try to move from one span to the next.
+	} else if b.span < len(b.spans)-1 { // Try to move from one span to the next.
 		b.span++
 		b.idx += int(b.spans[b.span].Offset + 1)
 		b.bucket = 0
 		if b.spans[b.span].Length == 0 {
-			b.idx--
-			continue
+			// Pathological case that should never happen. We can't use this span, let's try again.
+			goto try
 		}
 		return b.idx, true
 	}
-
 	// We're out of options.
 	return 0, false
 }
 
-// An Insert describes how many new buckets have to be inserted before
-// processing the pos'th bucket from the original slice.
-type Insert struct {
+// An Interjection describes how many new buckets have to be introduced before
+// processing the pos'th delta from the original slice.
+type Interjection struct {
 	pos int
 	num int
 }
 
-// expandSpansForward returns the inserts to expand the bucket spans 'a' so that
-// they match the spans in 'b'. 'b' must cover the same or more buckets than
-// 'a', otherwise the function will return false.
+// compareSpans returns the interjections to convert a slice of deltas to a new
+// slice representing an expanded set of buckets, or false if incompatible
+// (e.g. if buckets were removed).
 //
 // Example:
 //
@@ -222,25 +220,25 @@ type Insert struct {
 //	deltas        6    -3    -3           3          -3     0     2     2                       1    -5     1
 //	delta mods:                          / \                     / \                                       / \
 //
-// Note for histograms with delta-encoded buckets: Whenever any new buckets are
-// introduced, the subsequent "old" bucket needs to readjust its delta to the
-// new base of 0. Thus, for the caller who wants to transform the set of
-// original deltas to a new set of deltas to match a new span layout that adds
-// buckets, we simply need to generate a list of inserts.
+// Note that whenever any new buckets are introduced, the subsequent "old"
+// bucket needs to readjust its delta to the new base of 0. Thus, for the caller
+// who wants to transform the set of original deltas to a new set of deltas to
+// match a new span layout that adds buckets, we simply need to generate a list
+// of interjections.
 //
-// Note: Within expandSpansForward we don't have to worry about the changes to the
+// Note: Within compareSpans we don't have to worry about the changes to the
 // spans themselves, thanks to the iterators we get to work with the more useful
 // bucket indices (which of course directly correspond to the buckets we have to
 // adjust).
-func expandSpansForward(a, b []histogram.Span) (forward []Insert, ok bool) {
+func compareSpans(a, b []histogram.Span) ([]Interjection, bool) {
 	ai := newBucketIterator(a)
 	bi := newBucketIterator(b)
 
-	var inserts []Insert
+	var interjections []Interjection
 
-	// When inter.num becomes > 0, this becomes a valid insert that should
-	// be yielded when we finish a streak of new buckets.
-	var inter Insert
+	// When inter.num becomes > 0, this becomes a valid interjection that
+	// should be yielded when we finish a streak of new buckets.
+	var inter Interjection
 
 	av, aOK := ai.Next()
 	bv, bOK := bi.Next()
@@ -250,240 +248,87 @@ loop:
 		case aOK && bOK:
 			switch {
 			case av == bv: // Both have an identical value. move on!
-				// Finish WIP insert and reset.
+				// Finish WIP interjection and reset.
 				if inter.num > 0 {
-					inserts = append(inserts, inter)
+					interjections = append(interjections, inter)
 				}
 				inter.num = 0
 				av, aOK = ai.Next()
 				bv, bOK = bi.Next()
 				inter.pos++
 			case av < bv: // b misses a value that is in a.
-				return inserts, false
+				return interjections, false
 			case av > bv: // a misses a value that is in b. Forward b and recompare.
 				inter.num++
 				bv, bOK = bi.Next()
 			}
 		case aOK && !bOK: // b misses a value that is in a.
-			return inserts, false
+			return interjections, false
 		case !aOK && bOK: // a misses a value that is in b. Forward b and recompare.
 			inter.num++
 			bv, bOK = bi.Next()
 		default: // Both iterators ran out. We're done.
 			if inter.num > 0 {
-				inserts = append(inserts, inter)
+				interjections = append(interjections, inter)
 			}
 			break loop
 		}
 	}
 
-	return inserts, true
+	return interjections, true
 }
 
-// expandSpansBothWays is similar to expandSpansForward, but now b may also
-// cover an entirely different set of buckets. The function returns the
-// “forward” inserts to expand 'a' to also cover all the buckets exclusively
-// covered by 'b', and it returns the “backward” inserts to expand 'b' to also
-// cover all the buckets exclusively covered by 'a'
-func expandSpansBothWays(a, b []histogram.Span) (forward, backward []Insert, mergedSpans []histogram.Span) {
-	ai := newBucketIterator(a)
-	bi := newBucketIterator(b)
-
-	var fInserts, bInserts []Insert
-	var lastBucket int
-	addBucket := func(b int) {
-		offset := b - lastBucket - 1
-		if offset == 0 && len(mergedSpans) > 0 {
-			mergedSpans[len(mergedSpans)-1].Length++
-		} else {
-			if len(mergedSpans) == 0 {
-				offset++
-			}
-			mergedSpans = append(mergedSpans, histogram.Span{
-				Offset: int32(offset),
-				Length: 1,
-			})
-		}
-
-		lastBucket = b
-	}
-
-	// When fInter.num (or bInter.num, respectively) becomes > 0, this
-	// becomes a valid insert that should be yielded when we finish a streak
-	// of new buckets.
-	var fInter, bInter Insert
-
-	av, aOK := ai.Next()
-	bv, bOK := bi.Next()
-loop:
-	for {
-		switch {
-		case aOK && bOK:
-			switch {
-			case av == bv: // Both have an identical value. move on!
-				// Finish WIP insert and reset.
-				if fInter.num > 0 {
-					fInserts = append(fInserts, fInter)
-					fInter.num = 0
-				}
-				if bInter.num > 0 {
-					bInserts = append(bInserts, bInter)
-					bInter.num = 0
-				}
-				addBucket(av)
-				av, aOK = ai.Next()
-				bv, bOK = bi.Next()
-				fInter.pos++
-				bInter.pos++
-			case av < bv: // b misses a value that is in a.
-				bInter.num++
-				// Collect the forward inserts before advancing
-				// the position of 'a'.
-				if fInter.num > 0 {
-					fInserts = append(fInserts, fInter)
-					fInter.num = 0
-				}
-				addBucket(av)
-				fInter.pos++
-				av, aOK = ai.Next()
-			case av > bv: // a misses a value that is in b. Forward b and recompare.
-				fInter.num++
-				// Collect the backward inserts before advancing the
-				// position of 'b'.
-				if bInter.num > 0 {
-					bInserts = append(bInserts, bInter)
-					bInter.num = 0
-				}
-				addBucket(bv)
-				bInter.pos++
-				bv, bOK = bi.Next()
-			}
-		case aOK && !bOK: // b misses a value that is in a.
-			bInter.num++
-			addBucket(av)
-			av, aOK = ai.Next()
-		case !aOK && bOK: // a misses a value that is in b. Forward b and recompare.
-			fInter.num++
-			addBucket(bv)
-			bv, bOK = bi.Next()
-		default: // Both iterators ran out. We're done.
-			if fInter.num > 0 {
-				fInserts = append(fInserts, fInter)
-			}
-			if bInter.num > 0 {
-				bInserts = append(bInserts, bInter)
-			}
-			break loop
-		}
-	}
-
-	return fInserts, bInserts, mergedSpans
-}
-
-type bucketValue interface {
-	int64 | float64
-}
-
-// insert merges 'in' with the provided inserts and writes them into 'out',
-// which must already have the appropriate length. 'out' is also returned for
-// convenience.
-func insert[BV bucketValue](in, out []BV, inserts []Insert, deltas bool) []BV {
+// interject merges 'in' with the provided interjections and writes them into
+// 'out', which must already have the appropriate length.
+func interject(in, out []int64, interjections []Interjection) []int64 {
 	var (
-		oi int // Position in out.
-		v  BV  // The last value seen.
-		ii int // The next insert to process.
+		j      int   // Position in out.
+		v      int64 // The last value seen.
+		interj int   // The next interjection to process.
 	)
 	for i, d := range in {
-		if ii < len(inserts) && i == inserts[ii].pos {
-			// We have an insert!
-			// Add insert.num new delta values such that their
-			// bucket values equate 0. When deltas==false, it means
-			// that it is an absolute value. So we set it to 0
-			// directly.
-			if deltas {
-				out[oi] = -v
-			} else {
-				out[oi] = 0
+		if interj < len(interjections) && i == interjections[interj].pos {
+
+			// We have an interjection!
+			// Add interjection.num new delta values such that their
+			// bucket values equate 0.
+			out[j] = int64(-v)
+			j++
+			for x := 1; x < interjections[interj].num; x++ {
+				out[j] = 0
+				j++
 			}
-			oi++
-			for x := 1; x < inserts[ii].num; x++ {
-				out[oi] = 0
-				oi++
-			}
-			ii++
+			interj++
 
 			// Now save the value from the input. The delta value we
 			// should save is the original delta value + the last
-			// value of the point before the insert (to undo the
-			// delta that was introduced by the insert). When
-			// deltas==false, it means that it is an absolute value,
-			// so we set it directly to the value in the 'in' slice.
-			if deltas {
-				out[oi] = d + v
-			} else {
-				out[oi] = d
-			}
-			oi++
+			// value of the point before the interjection (to undo
+			// the delta that was introduced by the interjection).
+			out[j] = d + v
+			j++
 			v = d + v
 			continue
 		}
-		// If there was no insert, the original delta is still valid.
-		out[oi] = d
-		oi++
+
+		// If there was no interjection, the original delta is still
+		// valid.
+		out[j] = d
+		j++
 		v += d
 	}
-	switch ii {
-	case len(inserts):
-		// All inserts processed. Nothing more to do.
-	case len(inserts) - 1:
-		// One more insert to process at the end.
-		if deltas {
-			out[oi] = -v
-		} else {
-			out[oi] = 0
-		}
-		oi++
-		for x := 1; x < inserts[ii].num; x++ {
-			out[oi] = 0
-			oi++
+	switch interj {
+	case len(interjections):
+		// All interjections processed. Nothing more to do.
+	case len(interjections) - 1:
+		// One more interjection to process at the end.
+		out[j] = int64(-v)
+		j++
+		for x := 1; x < interjections[interj].num; x++ {
+			out[j] = 0
+			j++
 		}
 	default:
-		panic("unprocessed inserts left")
+		panic("unprocessed interjections left")
 	}
 	return out
-}
-
-// counterResetHint returns a CounterResetHint based on the CounterResetHeader
-// and on the position into the chunk.
-func counterResetHint(crh CounterResetHeader, numRead uint16) histogram.CounterResetHint {
-	switch {
-	case crh == GaugeType:
-		// A gauge histogram chunk only contains gauge histograms.
-		return histogram.GaugeType
-	case numRead > 1:
-		// In a counter histogram chunk, there will not be any counter
-		// resets after the first histogram.
-		return histogram.NotCounterReset
-	case crh == CounterReset:
-		// If the chunk was started because of a counter reset, we can
-		// safely return that hint. This histogram always has to be
-		// treated as a counter reset.
-		return histogram.CounterReset
-	default:
-		// Sadly, we have to return "unknown" as the hint for all other
-		// cases, even if we know that the chunk was started without a
-		// counter reset. But we cannot be sure that the previous chunk
-		// still exists in the TSDB, so we conservatively return
-		// "unknown". On the bright side, this case should be relatively
-		// rare.
-		//
-		// TODO(beorn7): Nevertheless, if the current chunk is in the
-		// middle of a block (not the first chunk in the block for this
-		// series), it's probably safe to assume that the previous chunk
-		// will exist in the TSDB for as long as the current chunk
-		// exist, and we could safely return
-		// "histogram.NotCounterReset". This needs some more work and
-		// might not be worth the effort and/or risk. To be vetted...
-		return histogram.UnknownCounterReset
-	}
 }

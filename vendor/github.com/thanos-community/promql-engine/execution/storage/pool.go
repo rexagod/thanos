@@ -4,6 +4,7 @@
 package storage
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -67,7 +68,7 @@ func writeMatcher(sb *xxhash.Digest, m *labels.Matcher) {
 }
 
 func writeInt64(sb *xxhash.Digest, val int64) {
-	_, _ = sb.WriteString(strconv.FormatInt(val, 10))
+	_, _ = sb.WriteString(fmt.Sprintf("%d", val))
 	_, _ = sb.Write(sep)
 }
 
@@ -77,6 +78,6 @@ func writeString(sb *xxhash.Digest, val string) {
 }
 
 func writeBool(sb *xxhash.Digest, val bool) {
-	_, _ = sb.WriteString(strconv.FormatBool(val))
+	_, _ = sb.WriteString(fmt.Sprintf("%t", val))
 	_, _ = sb.Write(sep)
 }

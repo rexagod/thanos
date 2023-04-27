@@ -85,11 +85,11 @@ func (rule *RecordingRule) Eval(ctx context.Context, ts time.Time, query QueryFu
 
 		lb.Set(labels.MetricName, rule.name)
 
-		rule.labels.Range(func(l labels.Label) {
+		for _, l := range rule.labels {
 			lb.Set(l.Name, l.Value)
-		})
+		}
 
-		sample.Metric = lb.Labels(labels.EmptyLabels())
+		sample.Metric = lb.Labels(nil)
 	}
 
 	// Check that the rule does not produce identical metrics after applying

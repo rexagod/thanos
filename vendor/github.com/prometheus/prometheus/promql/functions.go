@@ -302,7 +302,7 @@ func funcHoltWinters(vals []parser.Value, args parser.Expressions, enh *EvalNode
 	// The trend factor argument.
 	tf := vals[2].(Vector)[0].V
 
-	// Check that the input parameters are valid.
+	// Sanity check the input.
 	if sf <= 0 || sf >= 1 {
 		panic(fmt.Errorf("invalid smoothing factor. Expected: 0 < sf < 1, got: %f", sf))
 	}
@@ -957,7 +957,7 @@ func funcHistogramQuantile(vals []parser.Value, args parser.Expressions, enh *Ev
 		if !ok {
 			sample.Metric = labels.NewBuilder(sample.Metric).
 				Del(excludedLabels...).
-				Labels(labels.EmptyLabels())
+				Labels(nil)
 
 			mb = &metricWithBuckets{sample.Metric, nil}
 			enh.signatureToMetricWithBuckets[string(enh.lblBuf)] = mb
@@ -1077,7 +1077,7 @@ func funcLabelReplace(vals []parser.Value, args parser.Expressions, enh *EvalNod
 				if len(res) > 0 {
 					lb.Set(dst, string(res))
 				}
-				outMetric = lb.Labels(labels.EmptyLabels())
+				outMetric = lb.Labels(nil)
 				enh.Dmn[h] = outMetric
 			}
 		}
@@ -1145,7 +1145,7 @@ func funcLabelJoin(vals []parser.Value, args parser.Expressions, enh *EvalNodeHe
 				lb.Set(dst, strval)
 			}
 
-			outMetric = lb.Labels(labels.EmptyLabels())
+			outMetric = lb.Labels(nil)
 			enh.Dmn[h] = outMetric
 		}
 
@@ -1383,7 +1383,7 @@ func (s *vectorByReverseValueHeap) Pop() interface{} {
 // createLabelsForAbsentFunction returns the labels that are uniquely and exactly matched
 // in a given expression. It is used in the absent functions.
 func createLabelsForAbsentFunction(expr parser.Expr) labels.Labels {
-	b := labels.NewBuilder(labels.EmptyLabels())
+	m := labels.Labels{}
 
 	var lm []*labels.Matcher
 	switch n := expr.(type) {
@@ -1392,26 +1392,25 @@ func createLabelsForAbsentFunction(expr parser.Expr) labels.Labels {
 	case *parser.MatrixSelector:
 		lm = n.VectorSelector.(*parser.VectorSelector).LabelMatchers
 	default:
-		return labels.EmptyLabels()
+		return m
 	}
 
-	// The 'has' map implements backwards-compatibility for historic behaviour:
-	// e.g. in `absent(x{job="a",job="b",foo="bar"})` then `job` is removed from the output.
-	// Note this gives arguably wrong behaviour for `absent(x{job="a",job="a",foo="bar"})`.
-	has := make(map[string]bool, len(lm))
+	empty := []string{}
 	for _, ma := range lm {
 		if ma.Name == labels.MetricName {
 			continue
 		}
-		if ma.Type == labels.MatchEqual && !has[ma.Name] {
-			b.Set(ma.Name, ma.Value)
-			has[ma.Name] = true
+		if ma.Type == labels.MatchEqual && !m.Has(ma.Name) {
+			m = labels.NewBuilder(m).Set(ma.Name, ma.Value).Labels(nil)
 		} else {
-			b.Del(ma.Name)
+			empty = append(empty, ma.Name)
 		}
 	}
 
-	return b.Labels(labels.EmptyLabels())
+	for _, v := range empty {
+		m = labels.NewBuilder(m).Del(v).Labels(nil)
+	}
+	return m
 }
 
 func stringFromArg(e parser.Expr) string {

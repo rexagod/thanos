@@ -94,7 +94,6 @@ type ruleConfig struct {
 	dataDir           string
 	lset              labels.Labels
 	ignoredLabelNames []string
-	storeRateLimits   store.SeriesSelectLimits
 }
 
 func (rc *ruleConfig) registerFlag(cmd extkingpin.FlagClause) {
@@ -104,7 +103,6 @@ func (rc *ruleConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.shipper.registerFlag(cmd)
 	rc.query.registerFlag(cmd)
 	rc.alertmgr.registerFlag(cmd)
-	rc.storeRateLimits.RegisterFlags(cmd)
 }
 
 // registerRule registers a rule command.
@@ -627,17 +625,16 @@ func runRule(
 				if httpProbe.IsReady() {
 					mint, maxt := tsdbStore.TimeRange()
 					return &infopb.StoreInfo{
-						MinTime:                      mint,
-						MaxTime:                      maxt,
-						SupportsSharding:             true,
-						SupportsWithoutReplicaLabels: true,
+						MinTime:           mint,
+						MaxTime:           maxt,
+						SupportsSharding:  true,
+						SendsSortedSeries: true,
 					}
 				}
 				return nil
 			}),
 		)
-		storeServer := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, tsdbStore), reg, conf.storeRateLimits)
-		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(storeServer, logger)))
+		options = append(options, grpcserver.WithServer(store.RegisterStoreServer(tsdbStore)))
 	}
 
 	options = append(options, grpcserver.WithServer(

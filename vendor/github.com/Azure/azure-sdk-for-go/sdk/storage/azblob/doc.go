@@ -1,8 +1,9 @@
 //go:build go1.18
 // +build go1.18
 
-// Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See License.txt in the project root for license information.
+// Copyright 2017 Microsoft Corporation. All rights reserved.
+// Use of this source code is governed by an MIT
+// license that can be found in the LICENSE file.
 
 /*
 
@@ -166,13 +167,13 @@ Examples
 	handle(err)
 
 	// Download the blob's contents and ensure that the download worked properly
-	blobDownloadResponse, err := blockBlobClient.DownloadStream(context.TODO(), nil)
+	blobDownloadResponse, err := blockBlobClient.Download(context.TODO(), nil)
 	handle(err)
 
 	// Use the bytes.Buffer object to read the downloaded data.
 	// RetryReaderOptions has a lot of in-depth tuning abilities, but for the sake of simplicity, we'll omit those here.
 	reader := blobDownloadResponse.Body(nil)
-	downloadData, err := io.ReadAll(reader)
+	downloadData, err := ioutil.ReadAll(reader)
 	handle(err)
 	if string(downloadData) != uploadData {
 		handle(errors.New("Uploaded data should be same as downloaded data"))

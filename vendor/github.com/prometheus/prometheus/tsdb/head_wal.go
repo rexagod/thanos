@@ -29,7 +29,6 @@ import (
 	"go.uber.org/atomic"
 
 	"github.com/prometheus/prometheus/model/exemplar"
-	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/metadata"
 	"github.com/prometheus/prometheus/storage"
@@ -42,15 +41,6 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 	"github.com/prometheus/prometheus/tsdb/wlog"
 )
-
-// histogramRecord combines both RefHistogramSample and RefFloatHistogramSample
-// to simplify the WAL replay.
-type histogramRecord struct {
-	ref chunks.HeadSeriesRef
-	t   int64
-	h   *histogram.Histogram
-	fh  *histogram.FloatHistogram
-}
 
 func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.HeadSeriesRef, mmappedChunks, oooMmappedChunks map[chunks.HeadSeriesRef][]*mmappedChunk) (err error) {
 	// Track number of samples that referenced a series we don't know about
@@ -71,7 +61,7 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
 
 		dec             record.Decoder
 		shards          = make([][]record.RefSample, n)
-		histogramShards = make([][]histogramRecord, n)
+		histogramShards = make([][]record.RefHistogramSample, n)
 
 		decoded                      = make(chan interface{}, 10)
 		decodeErr, seriesCreationErr error
@@ -98,11 +88,6 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
 		histogramsPool = sync.Pool{
 			New: func() interface{} {
 				return []record.RefHistogramSample{}
-			},
-		}
-		floatHistogramsPool = sync.Pool{
-			New: func() interface{} {
-				return []record.RefFloatHistogramSample{}
 			},
 		}
 		metadataPool = sync.Pool{
@@ -221,18 +206,6 @@ func (h *Head) loadWAL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
 				if err != nil {
 					decodeErr = &wlog.CorruptionErr{
 						Err:     errors.Wrap(err, "decode histograms"),
-						Segment: r.Segment(),
-						Offset:  r.Offset(),
-					}
-					return
-				}
-				decoded <- hists
-			case record.FloatHistogramSamples:
-				hists := floatHistogramsPool.Get().([]record.RefFloatHistogramSample)[:0]
-				hists, err = dec.FloatHistogramSamples(rec, hists)
-				if err != nil {
-					decodeErr = &wlog.CorruptionErr{
-						Err:     errors.Wrap(err, "decode float histograms"),
 						Segment: r.Segment(),
 						Offset:  r.Offset(),
 					}
@@ -364,7 +337,7 @@ Outer:
 						sam.Ref = r
 					}
 					mod := uint64(sam.Ref) % uint64(n)
-					histogramShards[mod] = append(histogramShards[mod], histogramRecord{ref: sam.Ref, t: sam.T, h: sam.H})
+					histogramShards[mod] = append(histogramShards[mod], sam)
 				}
 				for i := 0; i < n; i++ {
 					if len(histogramShards[i]) > 0 {
@@ -376,43 +349,6 @@ Outer:
 			}
 			//nolint:staticcheck // Ignore SA6002 relax staticcheck verification.
 			histogramsPool.Put(v)
-		case []record.RefFloatHistogramSample:
-			samples := v
-			minValidTime := h.minValidTime.Load()
-			// We split up the samples into chunks of 5000 samples or less.
-			// With O(300 * #cores) in-flight sample batches, large scrapes could otherwise
-			// cause thousands of very large in flight buffers occupying large amounts
-			// of unused memory.
-			for len(samples) > 0 {
-				m := 5000
-				if len(samples) < m {
-					m = len(samples)
-				}
-				for i := 0; i < n; i++ {
-					if histogramShards[i] == nil {
-						histogramShards[i] = processors[i].reuseHistogramBuf()
-					}
-				}
-				for _, sam := range samples[:m] {
-					if sam.T < minValidTime {
-						continue // Before minValidTime: discard.
-					}
-					if r, ok := multiRef[sam.Ref]; ok {
-						sam.Ref = r
-					}
-					mod := uint64(sam.Ref) % uint64(n)
-					histogramShards[mod] = append(histogramShards[mod], histogramRecord{ref: sam.Ref, t: sam.T, fh: sam.FH})
-				}
-				for i := 0; i < n; i++ {
-					if len(histogramShards[i]) > 0 {
-						processors[i].input <- walSubsetProcessorInputItem{histogramSamples: histogramShards[i]}
-						histogramShards[i] = nil
-					}
-				}
-				samples = samples[m:]
-			}
-			//nolint:staticcheck // Ignore SA6002 relax staticcheck verification.
-			floatHistogramsPool.Put(v)
 		case []record.RefMetadata:
 			for _, m := range v {
 				s := h.series.getByID(chunks.HeadSeriesRef(m.Ref))
@@ -499,14 +435,7 @@ func (h *Head) resetSeriesWithMMappedChunks(mSeries *memSeries, mmc, oooMmc []*m
 	h.metrics.chunksRemoved.Add(float64(len(mSeries.mmappedChunks)))
 	h.metrics.chunks.Add(float64(len(mmc) + len(oooMmc) - len(mSeries.mmappedChunks)))
 	mSeries.mmappedChunks = mmc
-	if len(oooMmc) == 0 {
-		mSeries.ooo = nil
-	} else {
-		if mSeries.ooo == nil {
-			mSeries.ooo = &memSeriesOOOFields{}
-		}
-		*mSeries.ooo = memSeriesOOOFields{oooMmappedChunks: oooMmc}
-	}
+	mSeries.oooMmappedChunks = oooMmc
 	// Cache the last mmapped chunk time, so we can skip calling append() for samples it will reject.
 	if len(mmc) == 0 {
 		mSeries.mmMaxTime = math.MinInt64
@@ -538,12 +467,12 @@ func (h *Head) resetSeriesWithMMappedChunks(mSeries *memSeries, mmc, oooMmc []*m
 type walSubsetProcessor struct {
 	input            chan walSubsetProcessorInputItem
 	output           chan []record.RefSample
-	histogramsOutput chan []histogramRecord
+	histogramsOutput chan []record.RefHistogramSample
 }
 
 type walSubsetProcessorInputItem struct {
 	samples          []record.RefSample
-	histogramSamples []histogramRecord
+	histogramSamples []record.RefHistogramSample
 	existingSeries   *memSeries
 	walSeriesRef     chunks.HeadSeriesRef
 }
@@ -551,7 +480,7 @@ type walSubsetProcessorInputItem struct {
 func (wp *walSubsetProcessor) setup() {
 	wp.input = make(chan walSubsetProcessorInputItem, 300)
 	wp.output = make(chan []record.RefSample, 300)
-	wp.histogramsOutput = make(chan []histogramRecord, 300)
+	wp.histogramsOutput = make(chan []record.RefHistogramSample, 300)
 }
 
 func (wp *walSubsetProcessor) closeAndDrain() {
@@ -573,7 +502,7 @@ func (wp *walSubsetProcessor) reuseBuf() []record.RefSample {
 }
 
 // If there is a buffer in the output chan, return it for reuse, otherwise return nil.
-func (wp *walSubsetProcessor) reuseHistogramBuf() []histogramRecord {
+func (wp *walSubsetProcessor) reuseHistogramBuf() []record.RefHistogramSample {
 	select {
 	case buf := <-wp.histogramsOutput:
 		return buf[:0]
@@ -612,6 +541,7 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 			if s.T <= ms.mmMaxTime {
 				continue
 			}
+			ms.isHistogramSeries = false
 			if s.T <= ms.mmMaxTime {
 				continue
 			}
@@ -632,32 +562,27 @@ func (wp *walSubsetProcessor) processWALSamples(h *Head, mmappedChunks, oooMmapp
 		}
 
 		for _, s := range in.histogramSamples {
-			if s.t < minValidTime {
+			if s.T < minValidTime {
 				continue
 			}
-			ms := h.series.getByID(s.ref)
+			ms := h.series.getByID(s.Ref)
 			if ms == nil {
 				unknownHistogramRefs++
 				continue
 			}
-			if s.t <= ms.mmMaxTime {
+			ms.isHistogramSeries = true
+			if s.T <= ms.mmMaxTime {
 				continue
 			}
-			var chunkCreated bool
-			if s.h != nil {
-				_, chunkCreated = ms.appendHistogram(s.t, s.h, 0, h.chunkDiskMapper, chunkRange)
-			} else {
-				_, chunkCreated = ms.appendFloatHistogram(s.t, s.fh, 0, h.chunkDiskMapper, chunkRange)
-			}
-			if chunkCreated {
+			if _, chunkCreated := ms.appendHistogram(s.T, s.H, 0, h.chunkDiskMapper, chunkRange); chunkCreated {
 				h.metrics.chunksCreated.Inc()
 				h.metrics.chunks.Inc()
 			}
-			if s.t > maxt {
-				maxt = s.t
+			if s.T > maxt {
+				maxt = s.T
 			}
-			if s.t < mint {
-				mint = s.t
+			if s.T < mint {
+				mint = s.T
 			}
 		}
 
@@ -823,9 +748,7 @@ func (h *Head) loadWBL(r *wlog.Reader, multiRef map[chunks.HeadSeriesRef]chunks.
 				// chunk size parameters, we are not taking care of that here.
 				// TODO(codesome): see if there is a way to avoid duplicate m-map chunks if
 				// the size of ooo chunk was reduced between restart.
-				if ms.ooo != nil {
-					ms.ooo.oooHeadChunk = nil
-				}
+				ms.oooHeadChunk = nil
 
 				processors[idx].mx.Unlock()
 			}

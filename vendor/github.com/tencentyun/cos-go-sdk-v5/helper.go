@@ -170,8 +170,6 @@ func IsLenReader(reader io.Reader) bool {
 		return true
 	case *strings.Reader:
 		return true
-	case *os.File:
-		return true
 	default:
 		return false
 	}

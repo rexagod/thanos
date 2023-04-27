@@ -396,7 +396,7 @@ type QueueManager struct {
 	flushDeadline        time.Duration
 	cfg                  config.QueueConfig
 	mcfg                 config.MetadataConfig
-	externalLabels       []labels.Label
+	externalLabels       labels.Labels
 	relabelConfigs       []*relabel.Config
 	sendExemplars        bool
 	sendNativeHistograms bool
@@ -454,19 +454,13 @@ func NewQueueManager(
 		logger = log.NewNopLogger()
 	}
 
-	// Copy externalLabels into slice which we need for processExternalLabels.
-	extLabelsSlice := make([]labels.Label, 0, externalLabels.Len())
-	externalLabels.Range(func(l labels.Label) {
-		extLabelsSlice = append(extLabelsSlice, l)
-	})
-
 	logger = log.With(logger, remoteName, client.Name(), endpoint, client.Endpoint())
 	t := &QueueManager{
 		logger:               logger,
 		flushDeadline:        flushDeadline,
 		cfg:                  cfg,
 		mcfg:                 mCfg,
-		externalLabels:       extLabelsSlice,
+		externalLabels:       externalLabels,
 		relabelConfigs:       relabelConfigs,
 		storeClient:          client,
 		sendExemplars:        enableExemplarRemoteWrite,
@@ -716,53 +710,6 @@ outer:
 	return true
 }
 
-func (t *QueueManager) AppendFloatHistograms(floatHistograms []record.RefFloatHistogramSample) bool {
-	if !t.sendNativeHistograms {
-		return true
-	}
-
-outer:
-	for _, h := range floatHistograms {
-		t.seriesMtx.Lock()
-		lbls, ok := t.seriesLabels[h.Ref]
-		if !ok {
-			t.metrics.droppedHistogramsTotal.Inc()
-			t.dataDropped.incr(1)
-			if _, ok := t.droppedSeries[h.Ref]; !ok {
-				level.Info(t.logger).Log("msg", "Dropped histogram for series that was not explicitly dropped via relabelling", "ref", h.Ref)
-			}
-			t.seriesMtx.Unlock()
-			continue
-		}
-		t.seriesMtx.Unlock()
-
-		backoff := model.Duration(5 * time.Millisecond)
-		for {
-			select {
-			case <-t.quit:
-				return false
-			default:
-			}
-			if t.shards.enqueue(h.Ref, timeSeries{
-				seriesLabels:   lbls,
-				timestamp:      h.T,
-				floatHistogram: h.FH,
-				sType:          tFloatHistogram,
-			}) {
-				continue outer
-			}
-
-			t.metrics.enqueueRetriesTotal.Inc()
-			time.Sleep(time.Duration(backoff))
-			backoff = backoff * 2
-			if backoff > t.cfg.MaxBackoff {
-				backoff = t.cfg.MaxBackoff
-			}
-		}
-	}
-	return true
-}
-
 // Start the queue manager sending samples to the remote storage.
 // Does not block.
 func (t *QueueManager) Start() {
@@ -822,8 +769,8 @@ func (t *QueueManager) StoreSeries(series []record.RefSeries, index int) {
 		t.seriesSegmentIndexes[s.Ref] = index
 
 		ls := processExternalLabels(s.Labels, t.externalLabels)
-		lbls, keep := relabel.Process(ls, t.relabelConfigs...)
-		if !keep || lbls.IsEmpty() {
+		lbls := relabel.Process(ls, t.relabelConfigs...)
+		if len(lbls) == 0 {
 			t.droppedSeries[s.Ref] = struct{}{}
 			continue
 		}
@@ -884,33 +831,44 @@ func (t *QueueManager) client() WriteClient {
 }
 
 func (t *QueueManager) internLabels(lbls labels.Labels) {
-	lbls.InternStrings(t.interner.intern)
+	for i, l := range lbls {
+		lbls[i].Name = t.interner.intern(l.Name)
+		lbls[i].Value = t.interner.intern(l.Value)
+	}
 }
 
 func (t *QueueManager) releaseLabels(ls labels.Labels) {
-	ls.ReleaseStrings(t.interner.release)
+	for _, l := range ls {
+		t.interner.release(l.Name)
+		t.interner.release(l.Value)
+	}
 }
 
 // processExternalLabels merges externalLabels into ls. If ls contains
 // a label in externalLabels, the value in ls wins.
-func processExternalLabels(ls labels.Labels, externalLabels []labels.Label) labels.Labels {
-	b := labels.NewScratchBuilder(ls.Len() + len(externalLabels))
-	j := 0
-	ls.Range(func(l labels.Label) {
-		for j < len(externalLabels) && l.Name > externalLabels[j].Name {
-			b.Add(externalLabels[j].Name, externalLabels[j].Value)
+func processExternalLabels(ls, externalLabels labels.Labels) labels.Labels {
+	i, j, result := 0, 0, make(labels.Labels, 0, len(ls)+len(externalLabels))
+	for i < len(ls) && j < len(externalLabels) {
+		if ls[i].Name < externalLabels[j].Name {
+			result = append(result, labels.Label{
+				Name:  ls[i].Name,
+				Value: ls[i].Value,
+			})
+			i++
+		} else if ls[i].Name > externalLabels[j].Name {
+			result = append(result, externalLabels[j])
+			j++
+		} else {
+			result = append(result, labels.Label{
+				Name:  ls[i].Name,
+				Value: ls[i].Value,
+			})
+			i++
 			j++
 		}
-		if j < len(externalLabels) && l.Name == externalLabels[j].Name {
-			j++
-		}
-		b.Add(l.Name, l.Value)
-	})
-	for ; j < len(externalLabels); j++ {
-		b.Add(externalLabels[j].Name, externalLabels[j].Value)
 	}
 
-	return b.Labels()
+	return append(append(result, ls[i:]...), externalLabels[j:]...)
 }
 
 func (t *QueueManager) updateShardsLoop() {
@@ -1176,7 +1134,7 @@ func (s *shards) enqueue(ref chunks.HeadSeriesRef, data timeSeries) bool {
 		case tExemplar:
 			s.qm.metrics.pendingExemplars.Inc()
 			s.enqueuedExemplars.Inc()
-		case tHistogram, tFloatHistogram:
+		case tHistogram:
 			s.qm.metrics.pendingHistograms.Inc()
 			s.enqueuedHistograms.Inc()
 		}
@@ -1201,7 +1159,6 @@ type timeSeries struct {
 	seriesLabels   labels.Labels
 	value          float64
 	histogram      *histogram.Histogram
-	floatHistogram *histogram.FloatHistogram
 	timestamp      int64
 	exemplarLabels labels.Labels
 	// The type of series: sample, exemplar, or histogram.
@@ -1214,7 +1171,6 @@ const (
 	tSample seriesType = iota
 	tExemplar
 	tHistogram
-	tFloatHistogram
 )
 
 func newQueue(batchSize, capacity int) *queue {
@@ -1402,8 +1358,7 @@ func (s *shards) runShard(ctx context.Context, shardID int, queue *queue) {
 			if len(batch) > 0 {
 				nPendingSamples, nPendingExemplars, nPendingHistograms := s.populateTimeSeries(batch, pendingData)
 				n := nPendingSamples + nPendingExemplars + nPendingHistograms
-				level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples,
-					"exemplars", nPendingExemplars, "shard", shardNum, "histograms", nPendingHistograms)
+				level.Debug(s.qm.logger).Log("msg", "runShard timer ticked, sending buffered data", "samples", nPendingSamples, "exemplars", nPendingExemplars, "shard", shardNum)
 				s.sendSamples(ctx, pendingData[:n], nPendingSamples, nPendingExemplars, nPendingHistograms, pBuf, &buf)
 			}
 			queue.ReturnForReuse(batch)
@@ -1443,9 +1398,6 @@ func (s *shards) populateTimeSeries(batch []timeSeries, pendingData []prompb.Tim
 			nPendingExemplars++
 		case tHistogram:
 			pendingData[nPending].Histograms = append(pendingData[nPending].Histograms, HistogramToHistogramProto(d.timestamp, d.histogram))
-			nPendingHistograms++
-		case tFloatHistogram:
-			pendingData[nPending].Histograms = append(pendingData[nPending].Histograms, FloatHistogramToHistogramProto(d.timestamp, d.floatHistogram))
 			nPendingHistograms++
 		}
 	}
