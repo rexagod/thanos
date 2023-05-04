@@ -6,8 +6,6 @@ package aggregate
 import (
 	"fmt"
 
-	"github.com/prometheus/prometheus/model/histogram"
-
 	"github.com/efficientgo/core/errors"
 
 	"github.com/prometheus/prometheus/promql/parser"
@@ -17,11 +15,10 @@ import (
 	"github.com/thanos-community/promql-engine/execution/parse"
 )
 
-type vectorAccumulator func([]float64, []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool)
+type vectorAccumulator func([]float64) float64
 
 type vectorTable struct {
 	timestamp   int64
-	histValue   *histogram.FloatHistogram
 	value       float64
 	hasValue    bool
 	accumulator vectorAccumulator
@@ -47,19 +44,13 @@ func newVectorizedTable(a vectorAccumulator) *vectorTable {
 }
 
 func (t *vectorTable) aggregate(_ float64, vector model.StepVector) {
-	t.timestamp = vector.T
-
-	if len(vector.SampleIDs) == 0 && len(vector.Histograms) == 0 {
+	if len(vector.SampleIDs) == 0 {
 		t.hasValue = false
 		return
 	}
 	t.hasValue = true
-
-	var ok bool
-	t.value, t.histValue, ok = t.accumulator(vector.Samples, vector.Histograms)
-	if !ok {
-		t.hasValue = false
-	}
+	t.timestamp = vector.T
+	t.value = t.accumulator(vector.Samples)
 }
 
 func (t *vectorTable) toVector(pool *model.VectorPool) model.StepVector {
@@ -67,11 +58,10 @@ func (t *vectorTable) toVector(pool *model.VectorPool) model.StepVector {
 	if !t.hasValue {
 		return result
 	}
-	if t.histValue == nil {
-		result.AppendSample(pool, 0, t.value)
-	} else {
-		result.AppendHistogram(pool, 0, t.histValue)
-	}
+
+	result.T = t.timestamp
+	result.SampleIDs = append(result.SampleIDs, 0)
+	result.Samples = append(result.Samples, t.value)
 	return result
 }
 
@@ -83,64 +73,24 @@ func newVectorAccumulator(expr parser.ItemType) (vectorAccumulator, error) {
 	t := parser.ItemTypeStr[expr]
 	switch t {
 	case "sum":
-		return func(float64s []float64, histograms []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			// Summing up mixed types is not defined.
-			if len(float64s) != 0 && len(histograms) != 0 {
-				return 0, nil, false
-			}
-			if len(float64s) > 0 {
-				return floats.Sum(float64s), nil, true
-			}
-			return 0, histogramSum(histograms), true
-		}, nil
+		return floats.Sum, nil
 	case "max":
-		return func(float64s []float64, hs []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			if len(float64s) > 0 {
-				return floats.Max(float64s), nil, true
-			}
-			return 0, nil, false
-		}, nil
+		return floats.Max, nil
 	case "min":
-		return func(float64s []float64, hs []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			if len(float64s) > 0 {
-				return floats.Min(float64s), nil, true
-			}
-			return 0, nil, false
-		}, nil
+		return floats.Min, nil
 	case "count":
-		return func(in []float64, hs []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			return float64(len(in)) + float64(len(hs)), nil, true
+		return func(in []float64) float64 {
+			return float64(len(in))
 		}, nil
 	case "avg":
-		return func(float64s []float64, histograms []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			if len(float64s) > 0 {
-				return floats.Sum(float64s) / float64(len(float64s)), nil, true
-			}
-			return 0, nil, false
+		return func(in []float64) float64 {
+			return floats.Sum(in) / float64(len(in))
 		}, nil
 	case "group":
-		return func(float64s []float64, histograms []*histogram.FloatHistogram) (float64, *histogram.FloatHistogram, bool) {
-			return 1, nil, true
+		return func(in []float64) float64 {
+			return 1
 		}, nil
 	}
 	msg := fmt.Sprintf("unknown aggregation function %s", t)
 	return nil, errors.Wrap(parse.ErrNotSupportedExpr, msg)
-}
-
-func histogramSum(histograms []*histogram.FloatHistogram) *histogram.FloatHistogram {
-	if len(histograms) == 1 {
-		return histograms[0]
-	}
-
-	histSum := histograms[0]
-	for i := 1; i < len(histograms); i++ {
-		if histograms[i].Schema >= histSum.Schema {
-			histSum = histSum.Add(histograms[i])
-		} else {
-			t := histograms[i].Copy()
-			t.Add(histSum)
-			histSum = t
-		}
-	}
-	return histSum
 }

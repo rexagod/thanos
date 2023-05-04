@@ -418,15 +418,16 @@ config:
   storage_account_key: ""
   container: ""
   endpoint: ""
-  user_assigned_id: ""
   max_retries: 0
-  reader_config:
-    max_retry_requests: 0
+  msi_resource: ""
+  user_assigned_id: ""
   pipeline_config:
     max_tries: 0
     try_timeout: 0s
     retry_delay: 0s
     max_retry_delay: 0s
+  reader_config:
+    max_retry_requests: 0
   http_config:
     idle_conn_timeout: 0s
     response_header_timeout: 0s
@@ -443,7 +444,6 @@ config:
       server_name: ""
       insecure_skip_verify: false
     disable_compression: false
-  msi_resource: ""
 prefix: ""
 ```
 

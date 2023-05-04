@@ -116,7 +116,7 @@ func (l *localClient) TimeRange() (mint int64, maxt int64) {
 func (l *localClient) String() string {
 	mint, maxt := l.timeRangeFunc()
 	return fmt.Sprintf(
-		"LabelSets: %v MinTime: %d MaxTime: %d",
+		"LabelSets: %v Mint: %d Maxt: %d",
 		labelpb.PromLabelSetsToString(l.LabelSets()), mint, maxt,
 	)
 }
@@ -129,7 +129,7 @@ func (l *localClient) SupportsSharding() bool {
 	return true
 }
 
-func (l *localClient) SupportsWithoutReplicaLabels() bool {
+func (l *localClient) SendsSortedSeries() bool {
 	return true
 }
 
@@ -159,16 +159,13 @@ func (t *tenant) store() *store.TSDBStore {
 	return t.storeTSDB
 }
 
-func (t *tenant) client(logger log.Logger) store.Client {
+func (t *tenant) client() store.Client {
 	t.mtx.RLock()
 	defer t.mtx.RUnlock()
 
-	tsdbStore := t.store()
-	if tsdbStore == nil {
-		return nil
-	}
-	client := storepb.ServerAsClient(store.NewRecoverableStoreServer(logger, tsdbStore), 0)
-	return newLocalClient(client, tsdbStore.LabelSet, tsdbStore.TimeRange)
+	store := t.store()
+	client := storepb.ServerAsClient(store, 0)
+	return newLocalClient(client, store.LabelSet, store.TimeRange)
 }
 
 func (t *tenant) exemplars() *exemplars.TSDB {
@@ -432,10 +429,7 @@ func (t *MultiTSDB) TSDBLocalClients() []store.Client {
 
 	res := make([]store.Client, 0, len(t.tenants))
 	for _, tenant := range t.tenants {
-		client := tenant.client(t.logger)
-		if client != nil {
-			res = append(res, client)
-		}
+		res = append(res, tenant.client())
 	}
 
 	return res

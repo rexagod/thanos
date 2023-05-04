@@ -19,8 +19,6 @@ package jaegerremote // import "go.opentelemetry.io/contrib/samplers/jaegerremot
 import (
 	"time"
 
-	"github.com/go-logr/logr"
-
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -32,7 +30,6 @@ type config struct {
 	samplingParser          samplingStrategyParser
 	updaters                []samplerUpdater
 	posParams               perOperationSamplerParams
-	logger                  logr.Logger
 }
 
 // newConfig returns an appropriately configured config.
@@ -51,7 +48,6 @@ func newConfig(options ...Option) config {
 			MaxOperations:            defaultSamplingMaxOperations,
 			OperationNameLateBinding: defaultSamplingOperationNameLateBinding,
 		},
-		logger: logr.Discard(),
 	}
 	for _, option := range options {
 		option.apply(&c)
@@ -113,13 +109,6 @@ func WithOperationNameLateBinding(enable bool) Option {
 func WithSamplingRefreshInterval(samplingRefreshInterval time.Duration) Option {
 	return optionFunc(func(c *config) {
 		c.samplingRefreshInterval = samplingRefreshInterval
-	})
-}
-
-// WithLogger configures the sampler to log operation and debug information with logger.
-func WithLogger(logger logr.Logger) Option {
-	return optionFunc(func(c *config) {
-		c.logger = logger
 	})
 }
 

@@ -180,12 +180,11 @@ func (d *client) UploadTraces(ctx context.Context, protoSpans []*tracepb.Resourc
 				}
 
 				if respProto.PartialSuccess != nil {
-					msg := respProto.PartialSuccess.GetErrorMessage()
-					n := respProto.PartialSuccess.GetRejectedSpans()
-					if n != 0 || msg != "" {
-						err := internal.TracePartialSuccessError(n, msg)
-						otel.Handle(err)
-					}
+					otel.Handle(internal.PartialSuccessToError(
+						internal.TracingPartialSuccess,
+						respProto.PartialSuccess.RejectedSpans,
+						respProto.PartialSuccess.ErrorMessage,
+					))
 				}
 			}
 			return nil
@@ -197,7 +196,7 @@ func (d *client) UploadTraces(ctx context.Context, protoSpans []*tracepb.Resourc
 			}
 			return newResponseError(resp.Header)
 		default:
-			return fmt.Errorf("failed to send to %s: %s", request.URL, resp.Status)
+			return fmt.Errorf("failed to send %s to %s: %s", d.name, request.URL, resp.Status)
 		}
 	})
 }

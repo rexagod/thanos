@@ -17,7 +17,6 @@ import (
 	"context"
 	"net/http"
 	"sort"
-	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -38,7 +37,6 @@ type readHandler struct {
 	remoteReadMaxBytesInFrame int
 	remoteReadGate            *gate.Gate
 	queries                   prometheus.Gauge
-	marshalPool               *sync.Pool
 }
 
 // NewReadHandler creates a http.Handler that accepts remote read requests and
@@ -51,7 +49,6 @@ func NewReadHandler(logger log.Logger, r prometheus.Registerer, queryable storag
 		remoteReadSampleLimit:     remoteReadSampleLimit,
 		remoteReadGate:            gate.New(remoteReadConcurrencyLimit),
 		remoteReadMaxBytesInFrame: remoteReadMaxBytesInFrame,
-		marshalPool:               &sync.Pool{},
 
 		queries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: "prometheus",
@@ -228,7 +225,6 @@ func (h *readHandler) remoteReadStreamedXORChunks(ctx context.Context, w http.Re
 				querier.Select(true, hints, filteredMatchers...),
 				sortedExternalLabels,
 				h.remoteReadMaxBytesInFrame,
-				h.marshalPool,
 			)
 			if err != nil {
 				return err

@@ -2,36 +2,45 @@
 // +build go1.18
 
 // Copyright (c) Microsoft Corporation. All rights reserved.
-// Licensed under the MIT License. See License.txt in the project root for license information.
+// Licensed under the MIT License.
 
 package azblob
 
-import (
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/internal/generated"
-)
+var SASVersion = "2019-12-12"
 
-// PublicAccessType defines values for AccessType - private (default) or blob or container
-type PublicAccessType = generated.PublicAccessType
+//nolint
+const (
+	// BlockBlobMaxUploadBlobBytes indicates the maximum number of bytes that can be sent in a call to Upload.
+	BlockBlobMaxUploadBlobBytes = 256 * 1024 * 1024 // 256MB
+
+	// BlockBlobMaxStageBlockBytes indicates the maximum number of bytes that can be sent in a call to StageBlock.
+	BlockBlobMaxStageBlockBytes = 4000 * 1024 * 1024 // 4GB
+
+	// BlockBlobMaxBlocks indicates the maximum number of blocks allowed in a block blob.
+	BlockBlobMaxBlocks = 50000
+
+	// PageBlobPageBytes indicates the number of bytes in a page (512).
+	PageBlobPageBytes = 512
+
+	// BlobDefaultDownloadBlockSize is default block size
+	BlobDefaultDownloadBlockSize = int64(4 * 1024 * 1024) // 4MB
+)
 
 const (
-	PublicAccessTypeBlob      PublicAccessType = generated.PublicAccessTypeBlob
-	PublicAccessTypeContainer PublicAccessType = generated.PublicAccessTypeContainer
+	headerAuthorization     = "Authorization"
+	headerXmsDate           = "x-ms-date"
+	headerContentLength     = "Content-Length"
+	headerContentEncoding   = "Content-Encoding"
+	headerContentLanguage   = "Content-Language"
+	headerContentType       = "Content-Type"
+	headerContentMD5        = "Content-MD5"
+	headerIfModifiedSince   = "If-Modified-Since"
+	headerIfMatch           = "If-Match"
+	headerIfNoneMatch       = "If-None-Match"
+	headerIfUnmodifiedSince = "If-Unmodified-Since"
+	headerRange             = "Range"
 )
-
-// PossiblePublicAccessTypeValues returns the possible values for the PublicAccessType const type.
-func PossiblePublicAccessTypeValues() []PublicAccessType {
-	return generated.PossiblePublicAccessTypeValues()
-}
-
-// DeleteSnapshotsOptionType defines values for DeleteSnapshotsOptionType
-type DeleteSnapshotsOptionType = generated.DeleteSnapshotsOptionType
 
 const (
-	DeleteSnapshotsOptionTypeInclude DeleteSnapshotsOptionType = generated.DeleteSnapshotsOptionTypeInclude
-	DeleteSnapshotsOptionTypeOnly    DeleteSnapshotsOptionType = generated.DeleteSnapshotsOptionTypeOnly
+	tokenScope = "https://storage.azure.com/.default"
 )
-
-// PossibleDeleteSnapshotsOptionTypeValues returns the possible values for the DeleteSnapshotsOptionType const type.
-func PossibleDeleteSnapshotsOptionTypeValues() []DeleteSnapshotsOptionType {
-	return generated.PossibleDeleteSnapshotsOptionTypeValues()
-}

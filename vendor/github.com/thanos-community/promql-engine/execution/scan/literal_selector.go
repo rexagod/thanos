@@ -73,7 +73,9 @@ func (o *numberLiteralSelector) Next(ctx context.Context) ([]model.StepVector, e
 		if len(vectors) <= currStep {
 			vectors = append(vectors, o.vectorPool.GetStepVector(ts))
 		}
-		vectors[currStep].AppendSample(o.vectorPool, 0, o.val)
+
+		vectors[currStep].SampleIDs = append(vectors[currStep].SampleIDs, uint64(0))
+		vectors[currStep].Samples = append(vectors[currStep].Samples, o.val)
 
 		ts += o.step
 	}

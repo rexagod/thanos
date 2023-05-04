@@ -8,10 +8,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
-	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 
 	"github.com/thanos-io/objstore/exthttp"
 )
@@ -19,34 +18,32 @@ import (
 // DirDelim is the delimiter used to model a directory structure in an object store bucket.
 const DirDelim = "/"
 
-func getContainerClient(conf Config) (*container.Client, error) {
+func getContainerClient(conf Config) (*azblob.ContainerClient, error) {
 	dt, err := exthttp.DefaultTransport(conf.HTTPConfig)
 	if err != nil {
 		return nil, err
 	}
-	opt := &container.ClientOptions{
-		ClientOptions: azcore.ClientOptions{
-			Retry: policy.RetryOptions{
-				MaxRetries:    conf.PipelineConfig.MaxTries,
-				TryTimeout:    time.Duration(conf.PipelineConfig.TryTimeout),
-				RetryDelay:    time.Duration(conf.PipelineConfig.RetryDelay),
-				MaxRetryDelay: time.Duration(conf.PipelineConfig.MaxRetryDelay),
-			},
-			Telemetry: policy.TelemetryOptions{
-				ApplicationID: "Thanos",
-			},
-			Transport: &http.Client{Transport: dt},
+	opt := &azblob.ClientOptions{
+		Retry: policy.RetryOptions{
+			MaxRetries:    conf.PipelineConfig.MaxTries,
+			TryTimeout:    time.Duration(conf.PipelineConfig.TryTimeout),
+			RetryDelay:    time.Duration(conf.PipelineConfig.RetryDelay),
+			MaxRetryDelay: time.Duration(conf.PipelineConfig.MaxRetryDelay),
 		},
+		Telemetry: policy.TelemetryOptions{
+			ApplicationID: "Thanos",
+		},
+		Transport: &http.Client{Transport: dt},
 	}
 	containerURL := fmt.Sprintf("https://%s.%s/%s", conf.StorageAccountName, conf.Endpoint, conf.ContainerName)
 
 	// Use shared keys if set
 	if conf.StorageAccountKey != "" {
-		cred, err := container.NewSharedKeyCredential(conf.StorageAccountName, conf.StorageAccountKey)
+		cred, err := azblob.NewSharedKeyCredential(conf.StorageAccountName, conf.StorageAccountKey)
 		if err != nil {
 			return nil, err
 		}
-		containerClient, err := container.NewClientWithSharedKeyCredential(containerURL, cred, opt)
+		containerClient, err := azblob.NewContainerClientWithSharedKey(containerURL, cred, opt)
 		if err != nil {
 			return nil, err
 		}
@@ -62,7 +59,7 @@ func getContainerClient(conf Config) (*container.Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	containerClient, err := container.NewClient(containerURL, cred, opt)
+	containerClient, err := azblob.NewContainerClient(containerURL, cred, opt)
 	if err != nil {
 		return nil, err
 	}

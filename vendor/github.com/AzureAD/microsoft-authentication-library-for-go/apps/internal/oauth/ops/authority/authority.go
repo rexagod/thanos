@@ -9,7 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,7 +22,7 @@ import (
 const (
 	authorizationEndpoint             = "https://%v/%v/oauth2/v2.0/authorize"
 	instanceDiscoveryEndpoint         = "https://%v/common/discovery/instance"
-	tenantDiscoveryEndpointWithRegion = "https://%s.%s/%s/v2.0/.well-known/openid-configuration"
+	TenantDiscoveryEndpointWithRegion = "https://%v.r.%v/%v/v2.0/.well-known/openid-configuration"
 	regionName                        = "REGION_NAME"
 	defaultAPIVersion                 = "2021-10-01"
 	imdsEndpoint                      = "http://169.254.169.254/metadata/instance/compute/location?format=text&api-version=" + defaultAPIVersion
@@ -133,7 +133,7 @@ type AuthParams struct {
 	ClientID      string
 	// Redirecturi is used for auth flows that specify a redirect URI (e.g. local server for interactive auth flow).
 	Redirecturi   string
-	HomeAccountID string
+	HomeaccountID string
 	// Username is the user-name portion for username/password auth flow.
 	Username string
 	// Password is the password portion for username/password auth flow.
@@ -156,9 +156,6 @@ type AuthParams struct {
 	SendX5C bool
 	// UserAssertion is the access token used to acquire token on behalf of user
 	UserAssertion string
-
-	// KnownAuthorityHosts don't require metadata discovery because they're known to the user
-	KnownAuthorityHosts []string
 }
 
 // NewAuthParams creates an authorization parameters object.
@@ -246,7 +243,7 @@ const (
 	Managed   UserRealmAccountType = "Managed"
 )
 
-// UserRealm is used for the username password request to determine user type
+//UserRealm is used for the username password request to determine user type
 type UserRealm struct {
 	AccountType       UserRealmAccountType `json:"account_type"`
 	DomainName        string               `json:"domain_name"`
@@ -335,12 +332,7 @@ func (c Client) AADInstanceDiscovery(ctx context.Context, authorityInfo Info) (I
 		region = detectRegion(ctx)
 	}
 	if region != "" {
-		environment := authorityInfo.Host
-		switch environment {
-		case "login.microsoft.com", "login.windows.net", "sts.windows.net", defaultHost:
-			environment = "r." + defaultHost
-		}
-		resp.TenantDiscoveryEndpoint = fmt.Sprintf(tenantDiscoveryEndpointWithRegion, region, environment, authorityInfo.Tenant)
+		resp.TenantDiscoveryEndpoint = fmt.Sprintf(TenantDiscoveryEndpointWithRegion, region, authorityInfo.Host, authorityInfo.Tenant)
 		metadata := InstanceDiscoveryMetadata{
 			PreferredNetwork: fmt.Sprintf("%v.%v", region, authorityInfo.Host),
 			PreferredCache:   authorityInfo.Host,
@@ -386,7 +378,7 @@ func detectRegion(ctx context.Context) string {
 		}
 	}
 	defer resp.Body.Close()
-	response, err := io.ReadAll(resp.Body)
+	response, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return ""
 	}
@@ -401,7 +393,7 @@ func (a *AuthParams) CacheKey(isAppCache bool) string {
 		return a.AppKey()
 	}
 	if a.AuthorizationType == ATRefreshToken || a.AuthorizationType == AccountByID {
-		return a.HomeAccountID
+		return a.HomeaccountID
 	}
 	return ""
 }

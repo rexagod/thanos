@@ -130,7 +130,6 @@ type Config struct {
 	Insecure           bool               `yaml:"insecure"`
 	SignatureV2        bool               `yaml:"signature_version2"`
 	SecretKey          string             `yaml:"secret_key"`
-	SessionToken       string             `yaml:"session_token"`
 	PutUserMetadata    map[string]string  `yaml:"put_user_metadata"`
 	HTTPConfig         exthttp.HTTPConfig `yaml:"http_config"`
 	TraceConfig        TraceConfig        `yaml:"trace"`
@@ -229,7 +228,6 @@ func NewBucketWithConfig(logger log.Logger, config Config, component string) (*B
 			Value: credentials.Value{
 				AccessKeyID:     config.AccessKey,
 				SecretAccessKey: config.SecretKey,
-				SessionToken:    config.SessionToken,
 				SignerType:      credentials.SignatureV4,
 			},
 		})}
@@ -554,11 +552,10 @@ func (b *Bucket) getServerSideEncryption(ctx context.Context) (encrypt.ServerSid
 
 func configFromEnv() Config {
 	c := Config{
-		Bucket:       os.Getenv("S3_BUCKET"),
-		Endpoint:     os.Getenv("S3_ENDPOINT"),
-		AccessKey:    os.Getenv("S3_ACCESS_KEY"),
-		SecretKey:    os.Getenv("S3_SECRET_KEY"),
-		SessionToken: os.Getenv("S3_SESSION_TOKEN"),
+		Bucket:    os.Getenv("S3_BUCKET"),
+		Endpoint:  os.Getenv("S3_ENDPOINT"),
+		AccessKey: os.Getenv("S3_ACCESS_KEY"),
+		SecretKey: os.Getenv("S3_SECRET_KEY"),
 	}
 
 	c.Insecure, _ = strconv.ParseBool(os.Getenv("S3_INSECURE"))

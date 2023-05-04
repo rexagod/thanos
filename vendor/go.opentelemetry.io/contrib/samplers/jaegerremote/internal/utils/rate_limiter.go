@@ -36,6 +36,7 @@ import (
 //
 // It can also be used to limit the rate of traffic in bytes, by setting creditsPerSecond to desired throughput
 // as bytes/second, and calling CheckCredit() with the actual message size.
+//
 type RateLimiter struct {
 	lock sync.Mutex
 

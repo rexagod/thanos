@@ -9,21 +9,19 @@ import (
 	"sync"
 	"time"
 
-	"github.com/efficientgo/core/errors"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 
 	"github.com/thanos-community/promql-engine/execution/model"
 	engstore "github.com/thanos-community/promql-engine/execution/storage"
 	"github.com/thanos-community/promql-engine/query"
 
-	"github.com/prometheus/prometheus/model/histogram"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/value"
 
 	"github.com/prometheus/prometheus/storage"
 )
 
-var ErrNativeHistogramsUnsupported = errors.Newf("querying native histograms is not supported")
+var ErrNativeHistogramsUnsupported = fmt.Errorf("querying native histograms is not supported")
 
 type vectorScanner struct {
 	labels    labels.Labels
@@ -118,16 +116,13 @@ func (o *vectorSelector) Next(ctx context.Context) ([]model.StepVector, error) {
 			if len(vectors) <= currStep {
 				vectors = append(vectors, o.vectorPool.GetStepVector(seriesTs))
 			}
-			_, v, h, ok, err := selectPoint(series.samples, seriesTs, o.lookbackDelta, o.offset)
+			_, v, ok, err := selectPoint(series.samples, seriesTs, o.lookbackDelta, o.offset)
 			if err != nil {
 				return nil, err
 			}
 			if ok {
-				if h != nil {
-					vectors[currStep].AppendHistogram(o.vectorPool, series.signature, h)
-				} else {
-					vectors[currStep].AppendSample(o.vectorPool, series.signature, v)
-				}
+				vectors[currStep].SampleIDs = append(vectors[currStep].SampleIDs, series.signature)
+				vectors[currStep].Samples = append(vectors[currStep].Samples, v)
 			}
 			seriesTs += o.step
 		}
@@ -157,7 +152,7 @@ func (o *vectorSelector) loadSeries(ctx context.Context) error {
 			o.scanners[i] = vectorScanner{
 				labels:    s.Labels(),
 				signature: s.Signature,
-				samples:   storage.NewMemoizedIterator(s.Iterator(nil), o.lookbackDelta),
+				samples:   storage.NewMemoizedIterator(s.Iterator(), o.lookbackDelta),
 			}
 			o.series[i] = s.Labels()
 		}
@@ -167,36 +162,33 @@ func (o *vectorSelector) loadSeries(ctx context.Context) error {
 }
 
 // TODO(fpetkovski): Add max samples limit.
-func selectPoint(it *storage.MemoizedSeriesIterator, ts, lookbackDelta, offset int64) (int64, float64, *histogram.FloatHistogram, bool, error) {
+func selectPoint(it *storage.MemoizedSeriesIterator, ts, lookbackDelta, offset int64) (int64, float64, bool, error) {
 	refTime := ts - offset
 	var t int64
 	var v float64
-	var h *histogram.FloatHistogram
 
 	valueType := it.Seek(refTime)
 	switch valueType {
 	case chunkenc.ValNone:
 		if it.Err() != nil {
-			return 0, 0, nil, false, it.Err()
+			return 0, 0, false, it.Err()
 		}
-	case chunkenc.ValFloatHistogram:
-		return 0, 0, nil, false, ErrNativeHistogramsUnsupported
-	case chunkenc.ValHistogram:
-		t, h = it.AtFloatHistogram()
+	case chunkenc.ValHistogram, chunkenc.ValFloatHistogram:
+		return 0, 0, false, ErrNativeHistogramsUnsupported
 	case chunkenc.ValFloat:
 		t, v = it.At()
 	default:
-		panic(errors.Newf("unknown value type %v", valueType))
+		panic(fmt.Errorf("unknown value type %v", valueType))
 	}
 	if valueType == chunkenc.ValNone || t > refTime {
 		var ok bool
-		t, v, _, h, ok = it.PeekPrev()
+		t, v, _, _, ok = it.PeekPrev()
 		if !ok || t < refTime-lookbackDelta {
-			return 0, 0, nil, false, nil
+			return 0, 0, false, nil
 		}
 	}
 	if value.IsStaleNaN(v) {
-		return 0, 0, nil, false, nil
+		return 0, 0, false, nil
 	}
-	return t, v, h, true, nil
+	return t, v, true, nil
 }

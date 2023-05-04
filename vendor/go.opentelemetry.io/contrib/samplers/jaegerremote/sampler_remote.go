@@ -19,7 +19,7 @@ package jaegerremote // import "go.opentelemetry.io/contrib/samplers/jaegerremot
 import (
 	"encoding/json"
 	"fmt"
-	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"sync"
@@ -27,6 +27,7 @@ import (
 	"time"
 
 	jaeger_api_v2 "go.opentelemetry.io/contrib/samplers/jaegerremote/internal/proto-gen/jaeger-idl/proto/api_v2"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/sdk/trace"
 )
 
@@ -104,7 +105,7 @@ func (s *Sampler) ShouldSample(p trace.SamplingParameters) trace.SamplingResult 
 // go-routines it may have started.
 func (s *Sampler) Close() {
 	if swapped := atomic.CompareAndSwapInt64(&s.closed, 0, 1); !swapped {
-		s.logger.Info("repeated attempt to close the sampler is ignored")
+		otel.Handle(fmt.Errorf("repeated attempt to close the sampler is ignored"))
 		return
 	}
 
@@ -150,12 +151,12 @@ func (s *Sampler) setSampler(sampler trace.Sampler) {
 func (s *Sampler) UpdateSampler() {
 	res, err := s.samplingFetcher.Fetch(s.serviceName)
 	if err != nil {
-		s.logger.Error(err, "failed to fetch sampling strategy")
+		// log.Printf("failed to fetch sampling strategy: %v", err)
 		return
 	}
 	strategy, err := s.samplingParser.Parse(res)
 	if err != nil {
-		s.logger.Error(err, "failed to parse sampling strategy response")
+		// log.Printf("failed to parse sampling strategy response: %v", err)
 		return
 	}
 
@@ -163,7 +164,7 @@ func (s *Sampler) UpdateSampler() {
 	defer s.Unlock()
 
 	if err := s.updateSamplerViaUpdaters(strategy); err != nil {
-		s.logger.Error(err, "failed to handle sampling strategy response", "response", res)
+		//c.logger.Infof("failed to handle sampling strategy response %+v. Got error: %v", res, err)
 		return
 	}
 }
@@ -293,7 +294,7 @@ func (f *httpSamplingStrategyFetcher) Fetch(serviceName string) ([]byte, error) 
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}

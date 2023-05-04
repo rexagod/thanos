@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -81,7 +82,6 @@ func (l *openMetricsLexer) Error(es string) {
 // This is based on the working draft https://docs.google.com/document/u/1/d/1KwV0mAXwwbvvifBvDKH_LU1YjyXE_wxCkHNoCGq1GX0/edit
 type OpenMetricsParser struct {
 	l       *openMetricsLexer
-	builder labels.ScratchBuilder
 	series  []byte
 	text    []byte
 	mtype   MetricType
@@ -113,8 +113,8 @@ func (p *OpenMetricsParser) Series() ([]byte, *int64, float64) {
 	return p.series, nil, p.val
 }
 
-// Histogram returns (nil, nil, nil, nil) for now because OpenMetrics does not
-// support sparse histograms yet.
+// Histogram always returns (nil, nil, nil, nil) because OpenMetrics does not support
+// sparse histograms.
 func (p *OpenMetricsParser) Histogram() ([]byte, *int64, *histogram.Histogram, *histogram.FloatHistogram) {
 	return nil, nil, nil, nil
 }
@@ -158,11 +158,14 @@ func (p *OpenMetricsParser) Comment() []byte {
 // Metric writes the labels of the current sample into the passed labels.
 // It returns the string from which the metric was parsed.
 func (p *OpenMetricsParser) Metric(l *labels.Labels) string {
-	// Copy the buffer to a string: this is only necessary for the return value.
+	// Allocate the full immutable string immediately, so we just
+	// have to create references on it below.
 	s := string(p.series)
 
-	p.builder.Reset()
-	p.builder.Add(labels.MetricName, s[:p.offsets[0]-p.start])
+	*l = append(*l, labels.Label{
+		Name:  labels.MetricName,
+		Value: s[:p.offsets[0]-p.start],
+	})
 
 	for i := 1; i < len(p.offsets); i += 4 {
 		a := p.offsets[i] - p.start
@@ -170,16 +173,16 @@ func (p *OpenMetricsParser) Metric(l *labels.Labels) string {
 		c := p.offsets[i+2] - p.start
 		d := p.offsets[i+3] - p.start
 
-		value := s[c:d]
 		// Replacer causes allocations. Replace only when necessary.
 		if strings.IndexByte(s[c:d], byte('\\')) >= 0 {
-			value = lvalReplacer.Replace(value)
+			*l = append(*l, labels.Label{Name: s[a:b], Value: lvalReplacer.Replace(s[c:d])})
+			continue
 		}
-		p.builder.Add(s[a:b], value)
+		*l = append(*l, labels.Label{Name: s[a:b], Value: s[c:d]})
 	}
 
-	p.builder.Sort()
-	*l = p.builder.Labels()
+	// Sort labels.
+	sort.Sort(*l)
 
 	return s
 }
@@ -201,18 +204,17 @@ func (p *OpenMetricsParser) Exemplar(e *exemplar.Exemplar) bool {
 		e.Ts = p.exemplarTs
 	}
 
-	p.builder.Reset()
 	for i := 0; i < len(p.eOffsets); i += 4 {
 		a := p.eOffsets[i] - p.start
 		b := p.eOffsets[i+1] - p.start
 		c := p.eOffsets[i+2] - p.start
 		d := p.eOffsets[i+3] - p.start
 
-		p.builder.Add(s[a:b], s[c:d])
+		e.Labels = append(e.Labels, labels.Label{Name: s[a:b], Value: s[c:d]})
 	}
 
-	p.builder.Sort()
-	e.Labels = p.builder.Labels()
+	// Sort the labels.
+	sort.Sort(e.Labels)
 
 	return true
 }

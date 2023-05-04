@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -143,7 +144,6 @@ func (l *promlexer) Error(es string) {
 // Prometheus text exposition format.
 type PromParser struct {
 	l       *promlexer
-	builder labels.ScratchBuilder
 	series  []byte
 	text    []byte
 	mtype   MetricType
@@ -168,8 +168,8 @@ func (p *PromParser) Series() ([]byte, *int64, float64) {
 	return p.series, nil, p.val
 }
 
-// Histogram returns (nil, nil, nil, nil) for now because the Prometheus text
-// format does not support sparse histograms yet.
+// Histogram always returns (nil, nil, nil, nil) because the Prometheus text format
+// does not support sparse histograms.
 func (p *PromParser) Histogram() ([]byte, *int64, *histogram.Histogram, *histogram.FloatHistogram) {
 	return nil, nil, nil, nil
 }
@@ -212,11 +212,14 @@ func (p *PromParser) Comment() []byte {
 // Metric writes the labels of the current sample into the passed labels.
 // It returns the string from which the metric was parsed.
 func (p *PromParser) Metric(l *labels.Labels) string {
-	// Copy the buffer to a string: this is only necessary for the return value.
+	// Allocate the full immutable string immediately, so we just
+	// have to create references on it below.
 	s := string(p.series)
 
-	p.builder.Reset()
-	p.builder.Add(labels.MetricName, s[:p.offsets[0]-p.start])
+	*l = append(*l, labels.Label{
+		Name:  labels.MetricName,
+		Value: s[:p.offsets[0]-p.start],
+	})
 
 	for i := 1; i < len(p.offsets); i += 4 {
 		a := p.offsets[i] - p.start
@@ -224,16 +227,16 @@ func (p *PromParser) Metric(l *labels.Labels) string {
 		c := p.offsets[i+2] - p.start
 		d := p.offsets[i+3] - p.start
 
-		value := s[c:d]
 		// Replacer causes allocations. Replace only when necessary.
 		if strings.IndexByte(s[c:d], byte('\\')) >= 0 {
-			value = lvalReplacer.Replace(value)
+			*l = append(*l, labels.Label{Name: s[a:b], Value: lvalReplacer.Replace(s[c:d])})
+			continue
 		}
-		p.builder.Add(s[a:b], value)
+		*l = append(*l, labels.Label{Name: s[a:b], Value: s[c:d]})
 	}
 
-	p.builder.Sort()
-	*l = p.builder.Labels()
+	// Sort labels to maintain the sorted labels invariant.
+	sort.Sort(*l)
 
 	return s
 }
@@ -340,7 +343,7 @@ func (p *PromParser) Next() (Entry, error) {
 			t2 = p.nextToken()
 		}
 		if t2 != tValue {
-			return EntryInvalid, parseError("expected value after metric", t2)
+			return EntryInvalid, parseError("expected value after metric", t)
 		}
 		if p.val, err = parseFloat(yoloString(p.l.buf())); err != nil {
 			return EntryInvalid, err
@@ -350,7 +353,7 @@ func (p *PromParser) Next() (Entry, error) {
 			p.val = math.Float64frombits(value.NormalNaN)
 		}
 		p.hasTS = false
-		switch t := p.nextToken(); t {
+		switch p.nextToken() {
 		case tLinebreak:
 			break
 		case tTimestamp:
@@ -359,7 +362,7 @@ func (p *PromParser) Next() (Entry, error) {
 				return EntryInvalid, err
 			}
 			if t2 := p.nextToken(); t2 != tLinebreak {
-				return EntryInvalid, parseError("expected next entry after timestamp", t2)
+				return EntryInvalid, parseError("expected next entry after timestamp", t)
 			}
 		default:
 			return EntryInvalid, parseError("expected timestamp or new record", t)
