@@ -36,6 +36,9 @@ Flags:
                                  Number of goroutines to use when constructing
                                  index-cache.json blocks from object storage.
                                  Must be equal or greater than 1.
+      --bucket-web-label=BUCKET-WEB-LABEL
+                                 External block label to use as group title in
+                                 the bucket web UI
       --cache-index-header       Cache TSDB index-headers on disk to reduce
                                  startup time. When set to true, Thanos Store
                                  will download index headers from remote object
@@ -56,13 +59,17 @@ Flags:
                                  NOTE: Putting raw blocks here will not
                                  cause the store to read them. For such use
                                  cases use Prometheus + sidecar. Ignored if
-                                 -no-cache-index-header option is specified.
+                                 --no-cache-index-header option is specified.
       --grpc-address="0.0.0.0:10901"
                                  Listen ip:port address for gRPC endpoints
                                  (StoreAPI). Make sure this address is routable
                                  from other components.
       --grpc-grace-period=2m     Time to wait after an interrupt received for
                                  GRPC Server.
+      --grpc-server-max-connection-age=60m
+                                 The grpc server max connection age. This
+                                 controls how often to re-establish connections
+                                 and redo TLS handshakes.
       --grpc-server-tls-cert=""  TLS Certificate for gRPC server, leave blank to
                                  disable TLS
       --grpc-server-tls-client-ca=""
@@ -335,10 +342,6 @@ config:
   dial_timeout: 5s
   read_timeout: 3s
   write_timeout: 3s
-  pool_size: 100
-  min_idle_conns: 10
-  idle_timeout: 5m0s
-  max_conn_age: 0s
   max_get_multi_concurrency: 100
   get_multi_batch_size: 100
   max_set_multi_concurrency: 100
@@ -352,6 +355,8 @@ config:
     insecure_skip_verify: false
   cache_size: 0
   master_name: ""
+  max_async_buffer_size: 10000
+  max_async_concurrency: 20
 ```
 
 The **required** settings are:

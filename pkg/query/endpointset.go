@@ -11,6 +11,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/thanos-io/thanos/pkg/api/query/querypb"
 
@@ -218,7 +219,13 @@ func newEndpointSetNodeCollector(labels ...string) *endpointSetNodeCollector {
 // truncateExtLabels truncates the stringify external labels with the format of {labels..}.
 func truncateExtLabels(s string, threshold int) string {
 	if len(s) > threshold {
-		return fmt.Sprintf("%s}", s[:threshold-1])
+		for cut := 1; cut < 4; cut++ {
+			for cap := 1; cap < 4; cap++ {
+				if utf8.ValidString(s[threshold-cut-cap : threshold-cut]) {
+					return fmt.Sprintf("%s}", s[:threshold-cut])
+				}
+			}
+		}
 	}
 	return s
 }
@@ -356,6 +363,8 @@ func (e *EndpointSet) Update(ctx context.Context) {
 	)
 
 	for _, spec := range e.endpointSpec() {
+		spec := spec
+
 		if er, existingRef := e.endpoints[spec.Addr()]; existingRef {
 			wg.Add(1)
 			go func(spec *GRPCEndpointSpec) {
@@ -472,7 +481,10 @@ func (e *EndpointSet) getTimedOutRefs() map[string]*endpointRef {
 			continue
 		}
 
-		lastCheck := er.getStatus().LastCheck
+		er.mtx.RLock()
+		lastCheck := er.status.LastCheck
+		er.mtx.RUnlock()
+
 		if now.Sub(lastCheck) >= e.unhealthyEndpointTimeout {
 			result[er.addr] = er
 		}
@@ -502,12 +514,14 @@ func (e *EndpointSet) GetStoreClients() []store.Client {
 	stores := make([]store.Client, 0, len(endpoints))
 	for _, er := range endpoints {
 		if er.HasStoreAPI() {
+			er.mtx.RLock()
 			// Make a new endpointRef with store client.
 			stores = append(stores, &endpointRef{
 				StoreClient: storepb.NewStoreClient(er.cc),
 				addr:        er.addr,
 				metadata:    er.metadata,
 			})
+			er.mtx.RUnlock()
 		}
 	}
 	return stores
@@ -520,9 +534,8 @@ func (e *EndpointSet) GetQueryAPIClients() []Client {
 	queryClients := make([]Client, 0, len(endpoints))
 	for _, er := range endpoints {
 		if er.HasQueryAPI() {
-			_, maxt := er.timeRange()
 			client := querypb.NewQueryClient(er.cc)
-			queryClients = append(queryClients, NewClient(client, er.addr, maxt, er.labelSets()))
+			queryClients = append(queryClients, NewClient(client, er.addr, er.TSDBInfos()))
 		}
 	}
 	return queryClients
@@ -599,7 +612,10 @@ func (e *EndpointSet) GetEndpointStatus() []EndpointStatus {
 
 	statuses := make([]EndpointStatus, 0, len(e.endpoints))
 	for _, v := range e.endpoints {
-		status := v.getStatus()
+		v.mtx.RLock()
+		defer v.mtx.RUnlock()
+
+		status := v.status
 		if status != nil {
 			statuses = append(statuses, *status)
 		}
@@ -629,7 +645,15 @@ type endpointRef struct {
 // newEndpointRef creates a new endpointRef with a gRPC channel to the given the IP address.
 // The call to newEndpointRef will return an error if establishing the channel fails.
 func (e *EndpointSet) newEndpointRef(ctx context.Context, spec *GRPCEndpointSpec) (*endpointRef, error) {
-	dialOpts := append(e.dialOpts, spec.dialOpts...)
+	var dialOpts []grpc.DialOption
+
+	dialOpts = append(dialOpts, e.dialOpts...)
+	dialOpts = append(dialOpts, spec.dialOpts...)
+	// By default DialContext is non-blocking which means that any connection
+	// failure won't be reported/logged. Instead block until the connection is
+	// successfully established and return the details of the connection error
+	// if any.
+	dialOpts = append(dialOpts, grpc.WithReturnConnectionError())
 	conn, err := grpc.DialContext(ctx, spec.Addr(), dialOpts...)
 	if err != nil {
 		return nil, errors.Wrap(err, "dialing connection")
@@ -646,8 +670,8 @@ func (e *EndpointSet) newEndpointRef(ctx context.Context, spec *GRPCEndpointSpec
 
 // update sets the metadata and status of the endpoint ref based on the info response value and error.
 func (er *endpointRef) update(now nowFunc, metadata *endpointMetadata, err error) {
-	er.mtx.RLock()
-	defer er.mtx.RUnlock()
+	er.mtx.Lock()
+	defer er.mtx.Unlock()
 
 	er.updateMetadata(metadata, err)
 	er.updateStatus(now, err)
@@ -685,18 +709,14 @@ func (er *endpointRef) updateMetadata(metadata *endpointMetadata, err error) {
 	}
 }
 
-func (er *endpointRef) getStatus() *EndpointStatus {
-	er.mtx.RLock()
-	defer er.mtx.RUnlock()
-
-	return er.status
-}
-
 // isQueryable returns true if an endpointRef should be used for querying.
 // A strict endpointRef is always queriable. A non-strict endpointRef
 // is queryable if the last health check (info call) succeeded.
 func (er *endpointRef) isQueryable() bool {
-	return er.isStrict || er.getStatus().LastError == nil
+	er.mtx.RLock()
+	defer er.mtx.RUnlock()
+
+	return er.isStrict || er.status.LastError == nil
 }
 
 func (er *endpointRef) ComponentType() component.Component {
@@ -787,6 +807,18 @@ func (er *endpointRef) TimeRange() (mint, maxt int64) {
 	defer er.mtx.RUnlock()
 
 	return er.timeRange()
+}
+
+func (er *endpointRef) TSDBInfos() []infopb.TSDBInfo {
+	er.mtx.RLock()
+	defer er.mtx.RUnlock()
+
+	if er.metadata == nil || er.metadata.Store == nil {
+		return nil
+	}
+
+	// Currently, min/max time of only StoreAPI is being updated by all components.
+	return er.metadata.Store.TsdbInfos
 }
 
 func (er *endpointRef) timeRange() (int64, int64) {

@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/pprof"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/store/storepb/prompb"
+	"github.com/thanos-io/thanos/pkg/tenancy"
 )
 
 type fakeTenantAppendable struct {
@@ -160,10 +162,11 @@ func (f *fakeAppender) Rollback() error {
 	return f.rollbackErr()
 }
 
-func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64, hashringAlgo HashringAlgorithm) ([]*Handler, Hashring) {
+func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uint64, hashringAlgo HashringAlgorithm) ([]*Handler, Hashring, error) {
 	var (
 		cfg      = []HashringConfig{{Hashring: "test"}}
 		handlers []*Handler
+		wOpts    = &WriterOptions{}
 	)
 	// create a fake peer group where we manually fill the cache with fake addresses pointed to our handlers
 	// This removes the network from the tests and creates a more consistent testing harness.
@@ -180,21 +183,21 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 	}
 
 	ag := addrGen{}
-	limiter, _ := NewLimiter(NewNopConfig(), nil, RouterIngestor, log.NewNopLogger())
+	limiter, _ := NewLimiter(NewNopConfig(), nil, RouterIngestor, log.NewNopLogger(), 1*time.Second)
 	for i := range appendables {
 		h := NewHandler(nil, &Options{
-			TenantHeader:      DefaultTenantHeader,
+			TenantHeader:      tenancy.DefaultTenantHeader,
 			ReplicaHeader:     DefaultReplicaHeader,
 			ReplicationFactor: replicationFactor,
 			ForwardTimeout:    5 * time.Minute,
-			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), false),
+			Writer:            NewWriter(log.NewNopLogger(), newFakeTenantAppendable(appendables[i]), wOpts),
 			Limiter:           limiter,
 		})
 		handlers = append(handlers, h)
 		h.peers = peers
 		addr := ag.newAddr()
 		h.options.Endpoint = addr
-		cfg[0].Endpoints = append(cfg[0].Endpoints, h.options.Endpoint)
+		cfg[0].Endpoints = append(cfg[0].Endpoints, Endpoint{Address: h.options.Endpoint})
 		peers.cache[addr] = &fakeRemoteWriteGRPCServer{h: h}
 	}
 	// Use hashmod as default.
@@ -202,11 +205,14 @@ func newTestHandlerHashring(appendables []*fakeAppendable, replicationFactor uin
 		hashringAlgo = AlgorithmHashmod
 	}
 
-	hashring := newMultiHashring(hashringAlgo, replicationFactor, cfg)
+	hashring, err := NewMultiHashring(hashringAlgo, replicationFactor, cfg)
+	if err != nil {
+		return nil, nil, err
+	}
 	for _, h := range handlers {
 		h.Hashring(hashring)
 	}
-	return handlers, hashring
+	return handlers, hashring, nil
 }
 
 func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsistencyDelay bool) {
@@ -576,7 +582,10 @@ func testReceiveQuorum(t *testing.T, hashringAlgo HashringAlgorithm, withConsist
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			handlers, hashring := newTestHandlerHashring(tc.appendables, tc.replicationFactor, hashringAlgo)
+			handlers, hashring, err := newTestHandlerHashring(tc.appendables, tc.replicationFactor, hashringAlgo)
+			if err != nil {
+				t.Fatalf("unable to create test handler: %v", err)
+			}
 			tenant := "test"
 			// Test from the point of view of every node
 			// so that we know status code does not depend
@@ -706,7 +715,10 @@ func TestReceiveWriteRequestLimits(t *testing.T) {
 					appender: newFakeAppender(nil, nil, nil),
 				},
 			}
-			handlers, _ := newTestHandlerHashring(appendables, 3, AlgorithmHashmod)
+			handlers, _, err := newTestHandlerHashring(appendables, 3, AlgorithmHashmod)
+			if err != nil {
+				t.Fatalf("unable to create test handler: %v", err)
+			}
 			handler := handlers[0]
 
 			tenant := "test"
@@ -729,7 +741,7 @@ func TestReceiveWriteRequestLimits(t *testing.T) {
 			testutil.Ok(t, os.WriteFile(tmpLimitsPath, tenantConfig, 0666))
 			limitConfig, _ := extkingpin.NewStaticPathContent(tmpLimitsPath)
 			handler.Limiter, _ = NewLimiter(
-				limitConfig, nil, RouterIngestor, log.NewNopLogger(),
+				limitConfig, nil, RouterIngestor, log.NewNopLogger(), 1*time.Second,
 			)
 
 			wreq := &prompb.WriteRequest{
@@ -915,7 +927,10 @@ func makeSeriesWithValues(numSeries int) []prompb.TimeSeries {
 func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 	dir := b.TempDir()
 
-	handlers, _ := newTestHandlerHashring([]*fakeAppendable{nil}, 1, AlgorithmHashmod)
+	handlers, _, err := newTestHandlerHashring([]*fakeAppendable{nil}, 1, AlgorithmHashmod)
+	if err != nil {
+		b.Fatalf("unable to create test handler: %v", err)
+	}
 	handler := handlers[0]
 
 	reg := prometheus.NewRegistry()
@@ -936,7 +951,7 @@ func benchmarkHandlerMultiTSDBReceiveRemoteWrite(b testutil.TB) {
 		metadata.NoneFunc,
 	)
 	defer func() { testutil.Ok(b, m.Close()) }()
-	handler.writer = NewWriter(logger, m, false)
+	handler.writer = NewWriter(logger, m, &WriterOptions{})
 
 	testutil.Ok(b, m.Flush())
 	testutil.Ok(b, m.Open())
@@ -1127,8 +1142,7 @@ func TestIsTenantValid(t *testing.T) {
 		},
 	} {
 		t.Run(tcase.name, func(t *testing.T) {
-			h := NewHandler(nil, &Options{})
-			err := h.isTenantValid(tcase.tenant)
+			err := tenancy.IsTenantValid(tcase.tenant)
 			if tcase.expectedErr != nil {
 				testutil.NotOk(t, err)
 				testutil.Equals(t, tcase.expectedErr.Error(), err.Error())
@@ -1506,4 +1520,51 @@ func TestRelabel(t *testing.T) {
 			testutil.Equals(t, tcase.expectedWriteRequest, tcase.writeRequest)
 		})
 	}
+}
+
+func TestGetStatsLimitParameter(t *testing.T) {
+	t.Run("invalid limit parameter, not integer", func(t *testing.T) {
+		r, err := http.NewRequest(http.MethodGet, "http://0:0", nil)
+		testutil.Ok(t, err)
+
+		q := r.URL.Query()
+		q.Add(LimitStatsQueryParam, "abc")
+		r.URL.RawQuery = q.Encode()
+
+		_, err = getStatsLimitParameter(r)
+		testutil.NotOk(t, err)
+	})
+	t.Run("invalid limit parameter, too large", func(t *testing.T) {
+		r, err := http.NewRequest(http.MethodGet, "http://0:0", nil)
+		testutil.Ok(t, err)
+
+		q := r.URL.Query()
+		q.Add(LimitStatsQueryParam, strconv.FormatUint(math.MaxInt+1, 10))
+		r.URL.RawQuery = q.Encode()
+
+		_, err = getStatsLimitParameter(r)
+		testutil.NotOk(t, err)
+	})
+	t.Run("not present returns default", func(t *testing.T) {
+		r, err := http.NewRequest(http.MethodGet, "http://0:0", nil)
+		testutil.Ok(t, err)
+
+		limit, err := getStatsLimitParameter(r)
+		testutil.Ok(t, err)
+		testutil.Equals(t, limit, DefaultStatsLimit)
+	})
+	t.Run("if present and valid, the parameter is returned", func(t *testing.T) {
+		r, err := http.NewRequest(http.MethodGet, "http://0:0", nil)
+		testutil.Ok(t, err)
+
+		const givenLimit = 20
+
+		q := r.URL.Query()
+		q.Add(LimitStatsQueryParam, strconv.FormatUint(givenLimit, 10))
+		r.URL.RawQuery = q.Encode()
+
+		limit, err := getStatsLimitParameter(r)
+		testutil.Ok(t, err)
+		testutil.Equals(t, limit, givenLimit)
+	})
 }

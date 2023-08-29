@@ -10,8 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"google.golang.org/grpc"
-
 	extflag "github.com/efficientgo/tools/extkingpin"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -26,9 +24,12 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/prometheus/prometheus/tsdb"
+	"google.golang.org/grpc"
+	"gopkg.in/yaml.v2"
+
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/client"
-	"gopkg.in/yaml.v2"
+	objstoretracing "github.com/thanos-io/objstore/tracing/opentracing"
 
 	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/component"
@@ -47,6 +48,7 @@ import (
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/store/labelpb"
+	"github.com/thanos-io/thanos/pkg/tenancy"
 	"github.com/thanos-io/thanos/pkg/tls"
 )
 
@@ -58,7 +60,7 @@ func registerReceive(app *extkingpin.App) {
 	conf := &receiveConfig{}
 	conf.registerFlag(cmd)
 
-	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
+	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, debugLogging bool) error {
 		lset, err := parseFlagLabels(conf.labelStrs)
 		if err != nil {
 			return errors.Wrap(err, "parse labels")
@@ -85,7 +87,7 @@ func registerReceive(app *extkingpin.App) {
 			NoLockfile:                     conf.noLockFile,
 			WALCompression:                 conf.walCompression,
 			MaxExemplars:                   conf.tsdbMaxExemplars,
-			EnableExemplarStorage:          true,
+			EnableExemplarStorage:          conf.tsdbMaxExemplars > 0,
 			HeadChunksWriteQueueSize:       int(conf.tsdbWriteQueueSize),
 			EnableMemorySnapshotOnShutdown: conf.tsdbMemorySnapshotOnShutdown,
 			EnableNativeHistograms:         conf.tsdbEnableNativeHistograms,
@@ -97,6 +99,7 @@ func registerReceive(app *extkingpin.App) {
 		return runReceive(
 			g,
 			logger,
+			debugLogging,
 			reg,
 			tracer,
 			grpcLogOpts, tagOpts,
@@ -113,6 +116,7 @@ func registerReceive(app *extkingpin.App) {
 func runReceive(
 	g *run.Group,
 	logger log.Logger,
+	debugLogging bool,
 	reg *prometheus.Registry,
 	tracer opentracing.Tracer,
 	grpcLogOpts []grpc_logging.Option,
@@ -137,8 +141,8 @@ func runReceive(
 		logger,
 		reg,
 		tracer,
-		*conf.grpcCert != "",
-		*conf.grpcClientCA == "",
+		conf.grpcConfig.tlsSrvCert != "",
+		conf.grpcConfig.tlsSrvClientCA == "",
 		conf.rwClientCert,
 		conf.rwClientKey,
 		conf.rwClientServerCA,
@@ -172,10 +176,11 @@ func runReceive(
 			}
 			// The background shipper continuously scans the data directory and uploads
 			// new blocks to object storage service.
-			bkt, err = client.NewBucket(logger, confContentYaml, reg, comp.String())
+			bkt, err = client.NewBucket(logger, confContentYaml, comp.String())
 			if err != nil {
 				return err
 			}
+			bkt = objstoretracing.WrapWithTraces(objstore.WrapWithMetrics(bkt, extprom.WrapRegistererWithPrefix("thanos_", reg), bkt.Name()))
 		} else {
 			level.Info(logger).Log("msg", "no supported bucket was configured, uploads will be disabled")
 		}
@@ -207,7 +212,10 @@ func runReceive(
 		conf.allowOutOfOrderUpload,
 		hashFunc,
 	)
-	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, conf.writerInterning)
+	writer := receive.NewWriter(log.With(logger, "component", "receive-writer"), dbs, &receive.WriterOptions{
+		Intern:                   conf.writerInterning,
+		TooFarInFutureTimeWindow: int64(time.Duration(*conf.tsdbTooFarInFutureTimeWindow)),
+	})
 
 	var limitsConfig *receive.RootLimitsConfig
 	if conf.writeLimitsConfig != nil {
@@ -220,7 +228,7 @@ func runReceive(
 			return errors.Wrap(err, "parse limit configuration")
 		}
 	}
-	limiter, err := receive.NewLimiter(conf.writeLimitsConfig, reg, receiveMode, log.With(logger, "component", "receive-limiter"))
+	limiter, err := receive.NewLimiter(conf.writeLimitsConfig, reg, receiveMode, log.With(logger, "component", "receive-limiter"), conf.limitsConfigReloadTimer)
 	if err != nil {
 		return errors.Wrap(err, "creating limiter")
 	}
@@ -241,6 +249,7 @@ func runReceive(
 		TLSConfig:         rwTLSConfig,
 		DialOpts:          dialOpts,
 		ForwardTimeout:    time.Duration(*conf.forwardTimeout),
+		MaxBackoff:        time.Duration(*conf.maxBackoff),
 		TSDBStats:         dbs,
 		Limiter:           limiter,
 	})
@@ -275,7 +284,7 @@ func runReceive(
 
 	level.Debug(logger).Log("msg", "setting up hashring")
 	{
-		if err := setupHashring(g, logger, reg, conf, hashringChangedChan, webHandler, statusProber, enableIngestion); err != nil {
+		if err := setupHashring(g, logger, reg, conf, hashringChangedChan, webHandler, statusProber, enableIngestion, dbs); err != nil {
 			return err
 		}
 	}
@@ -300,9 +309,14 @@ func runReceive(
 
 	level.Debug(logger).Log("msg", "setting up gRPC server")
 	{
-		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), *conf.grpcCert, *conf.grpcKey, *conf.grpcClientCA)
+		tlsCfg, err := tls.NewServerConfig(log.With(logger, "protocol", "gRPC"), conf.grpcConfig.tlsSrvCert, conf.grpcConfig.tlsSrvKey, conf.grpcConfig.tlsSrvClientCA)
 		if err != nil {
 			return errors.Wrap(err, "setup gRPC server")
+		}
+
+		options := []store.ProxyStoreOption{}
+		if debugLogging {
+			options = append(options, store.WithProxyStoreDebugLogging())
 		}
 
 		proxy := store.NewProxyStore(
@@ -313,6 +327,7 @@ func runReceive(
 			labels.Labels{},
 			0,
 			store.LazyRetrieval,
+			options...,
 		)
 		mts := store.NewLimitedStoreServer(store.NewInstrumentedStoreServer(reg, proxy), reg, conf.storeRateLimits)
 		rw := store.ReadWriteTSDBStore{
@@ -331,6 +346,7 @@ func runReceive(
 						MaxTime:                      maxTime,
 						SupportsSharding:             true,
 						SupportsWithoutReplicaLabels: true,
+						TsdbInfos:                    proxy.TSDBInfos(),
 					}
 				}
 				return nil
@@ -343,15 +359,30 @@ func runReceive(
 			grpcserver.WithServer(store.RegisterWritableStoreServer(rw)),
 			grpcserver.WithServer(exemplars.RegisterExemplarsServer(exemplars.NewMultiTSDB(dbs.TSDBExemplars))),
 			grpcserver.WithServer(info.RegisterInfoServer(infoSrv)),
-			grpcserver.WithListen(*conf.grpcBindAddr),
-			grpcserver.WithGracePeriod(time.Duration(*conf.grpcGracePeriod)),
+			grpcserver.WithListen(conf.grpcConfig.bindAddress),
+			grpcserver.WithGracePeriod(conf.grpcConfig.gracePeriod),
+			grpcserver.WithMaxConnAge(conf.grpcConfig.maxConnectionAge),
 			grpcserver.WithTLSConfig(tlsCfg),
-			grpcserver.WithMaxConnAge(*conf.grpcMaxConnAge),
 		)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		level.Debug(logger).Log("msg", "setting up periodic update for label names")
+		g.Add(func() error {
+			return runutil.Repeat(10*time.Second, ctx.Done(), func() error {
+				level.Debug(logger).Log("msg", "Starting label names update")
+
+				dbs.UpdateLabelNames(ctx)
+
+				level.Debug(logger).Log("msg", "Finished label names update")
+				return nil
+			})
+		}, func(err error) {
+			cancel()
+		})
 
 		g.Add(
 			func() error {
-				level.Info(logger).Log("msg", "listening for StoreAPI and WritableStoreAPI gRPC", "address", *conf.grpcBindAddr)
+				level.Info(logger).Log("msg", "listening for StoreAPI and WritableStoreAPI gRPC", "address", conf.grpcConfig.bindAddress)
 				statusProber.Healthy()
 				return srv.ListenAndServe()
 			},
@@ -438,12 +469,13 @@ func setupHashring(g *run.Group,
 	webHandler *receive.Handler,
 	statusProber prober.Probe,
 	enableIngestion bool,
+	dbs *receive.MultiTSDB,
 ) error {
 	// Note: the hashring configuration watcher
 	// is the sender and thus closes the chan.
 	// In the single-node case, which has no configuration
 	// watcher, we close the chan ourselves.
-	updates := make(chan receive.Hashring, 1)
+	updates := make(chan []receive.HashringConfig, 1)
 	algorithm := receive.HashringAlgorithm(conf.hashringsAlgorithm)
 
 	// The Hashrings config file path is given initializing config watcher.
@@ -462,33 +494,28 @@ func setupHashring(g *run.Group,
 
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
-			level.Info(logger).Log("msg", "the hashring initialized with config watcher.")
-			return receive.HashringFromConfigWatcher(ctx, algorithm, conf.replicationFactor, updates, cw)
+			return receive.ConfigFromWatcher(ctx, updates, cw)
 		}, func(error) {
 			cancel()
 		})
 	} else {
 		var (
-			ring receive.Hashring
-			err  error
+			cf  []receive.HashringConfig
+			err error
 		)
 		// The Hashrings config file content given initialize configuration from content.
 		if len(conf.hashringsFileContent) > 0 {
-			ring, err = receive.HashringFromConfig(algorithm, conf.replicationFactor, conf.hashringsFileContent)
+			cf, err = receive.ParseConfig([]byte(conf.hashringsFileContent))
 			if err != nil {
 				close(updates)
-				return errors.Wrap(err, "failed to validate hashring configuration file")
+				return errors.Wrap(err, "failed to validate hashring configuration content")
 			}
-			level.Info(logger).Log("msg", "the hashring initialized directly with the given content through the flag.")
-		} else {
-			level.Info(logger).Log("msg", "the hashring file is not specified use single node hashring.")
-			ring = receive.SingleNodeHashring(conf.endpoint)
 		}
 
 		cancel := make(chan struct{})
 		g.Add(func() error {
 			defer close(updates)
-			updates <- ring
+			updates <- cf
 			<-cancel
 			return nil
 		}, func(error) {
@@ -505,11 +532,27 @@ func setupHashring(g *run.Group,
 
 		for {
 			select {
-			case h, ok := <-updates:
+			case c, ok := <-updates:
 				if !ok {
 					return nil
 				}
-				webHandler.Hashring(h)
+
+				if c == nil {
+					webHandler.Hashring(receive.SingleNodeHashring(conf.endpoint))
+					level.Info(logger).Log("msg", "Empty hashring config. Set up single node hashring.")
+				} else {
+					h, err := receive.NewMultiHashring(algorithm, conf.replicationFactor, c)
+					if err != nil {
+						return errors.Wrap(err, "unable to create new hashring from config")
+					}
+					webHandler.Hashring(h)
+					level.Info(logger).Log("msg", "Set up hashring for the given hashring config.")
+				}
+
+				if err := dbs.SetHashringConfig(c); err != nil {
+					return errors.Wrap(err, "failed to set hashring config in MultiTSDB")
+				}
+
 				// If ingestion is enabled, send a signal to TSDB to flush.
 				if enableIngestion {
 					hashringChangedChan <- struct{}{}
@@ -682,12 +725,12 @@ func startTSDBAndUpload(g *run.Group,
 					case <-uploadC:
 						// Upload on demand.
 						if err := upload(ctx); err != nil {
-							level.Warn(logger).Log("msg", "on demand upload failed", "err", err)
+							level.Error(logger).Log("msg", "on demand upload failed", "err", err)
 						}
 						uploadDone <- struct{}{}
 					case <-tick.C:
 						if err := upload(ctx); err != nil {
-							level.Warn(logger).Log("msg", "recurring upload failed", "err", err)
+							level.Error(logger).Log("msg", "recurring upload failed", "err", err)
 						}
 					}
 				}
@@ -740,12 +783,7 @@ type receiveConfig struct {
 	httpGracePeriod *model.Duration
 	httpTLSConfig   *string
 
-	grpcBindAddr    *string
-	grpcGracePeriod *model.Duration
-	grpcCert        *string
-	grpcKey         *string
-	grpcClientCA    *string
-	grpcMaxConnAge  *time.Duration
+	grpcConfig grpcConfig
 
 	rwAddress          string
 	rwServerCert       string
@@ -775,10 +813,12 @@ type receiveConfig struct {
 	replicaHeader     string
 	replicationFactor uint64
 	forwardTimeout    *model.Duration
+	maxBackoff        *model.Duration
 	compression       string
 
 	tsdbMinBlockDuration         *model.Duration
 	tsdbMaxBlockDuration         *model.Duration
+	tsdbTooFarInFutureTimeWindow *model.Duration
 	tsdbOutOfOrderTimeWindow     *model.Duration
 	tsdbOutOfOrderCapMax         int64
 	tsdbAllowOverlappingBlocks   bool
@@ -799,13 +839,14 @@ type receiveConfig struct {
 	reqLogConfig      *extflag.PathOrContent
 	relabelConfigPath *extflag.PathOrContent
 
-	writeLimitsConfig *extflag.PathOrContent
-	storeRateLimits   store.SeriesSelectLimits
+	writeLimitsConfig       *extflag.PathOrContent
+	storeRateLimits         store.SeriesSelectLimits
+	limitsConfigReloadTimer time.Duration
 }
 
 func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.httpBindAddr, rc.httpGracePeriod, rc.httpTLSConfig = extkingpin.RegisterHTTPFlags(cmd)
-	rc.grpcBindAddr, rc.grpcGracePeriod, rc.grpcCert, rc.grpcKey, rc.grpcClientCA, rc.grpcMaxConnAge = extkingpin.RegisterGRPCFlags(cmd)
+	rc.grpcConfig.registerFlag(cmd)
 	rc.storeRateLimits.RegisterFlags(cmd)
 
 	cmd.Flag("remote-write.address", "Address to listen on for remote write requests.").
@@ -848,13 +889,13 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("receive.local-endpoint", "Endpoint of local receive node. Used to identify the local node in the hashring configuration. If it's empty AND hashring configuration was provided, it means that receive will run in RoutingOnly mode.").StringVar(&rc.endpoint)
 
-	cmd.Flag("receive.tenant-header", "HTTP header to determine tenant for write requests.").Default(receive.DefaultTenantHeader).StringVar(&rc.tenantHeader)
+	cmd.Flag("receive.tenant-header", "HTTP header to determine tenant for write requests.").Default(tenancy.DefaultTenantHeader).StringVar(&rc.tenantHeader)
 
-	cmd.Flag("receive.tenant-certificate-field", "Use TLS client's certificate field to determine tenant for write requests. Must be one of "+receive.CertificateFieldOrganization+", "+receive.CertificateFieldOrganizationalUnit+" or "+receive.CertificateFieldCommonName+". This setting will cause the receive.tenant-header flag value to be ignored.").Default("").EnumVar(&rc.tenantField, "", receive.CertificateFieldOrganization, receive.CertificateFieldOrganizationalUnit, receive.CertificateFieldCommonName)
+	cmd.Flag("receive.tenant-certificate-field", "Use TLS client's certificate field to determine tenant for write requests. Must be one of "+tenancy.CertificateFieldOrganization+", "+tenancy.CertificateFieldOrganizationalUnit+" or "+tenancy.CertificateFieldCommonName+". This setting will cause the receive.tenant-header flag value to be ignored.").Default("").EnumVar(&rc.tenantField, "", tenancy.CertificateFieldOrganization, tenancy.CertificateFieldOrganizationalUnit, tenancy.CertificateFieldCommonName)
 
-	cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(receive.DefaultTenant).StringVar(&rc.defaultTenantID)
+	cmd.Flag("receive.default-tenant-id", "Default tenant ID to use when none is provided via a header.").Default(tenancy.DefaultTenant).StringVar(&rc.defaultTenantID)
 
-	cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(receive.DefaultTenantLabel).StringVar(&rc.tenantLabelName)
+	cmd.Flag("receive.tenant-label-name", "Label name through which the tenant will be announced.").Default(tenancy.DefaultTenantLabel).StringVar(&rc.tenantLabelName)
 
 	cmd.Flag("receive.replica-header", "HTTP header specifying the replica number of a write request.").Default(receive.DefaultReplicaHeader).StringVar(&rc.replicaHeader)
 
@@ -865,11 +906,18 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	rc.forwardTimeout = extkingpin.ModelDuration(cmd.Flag("receive-forward-timeout", "Timeout for each forward request.").Default("5s").Hidden())
 
+	rc.maxBackoff = extkingpin.ModelDuration(cmd.Flag("receive-forward-max-backoff", "Maximum backoff for each forward fan-out request").Default("5s").Hidden())
+
 	rc.relabelConfigPath = extflag.RegisterPathOrContent(cmd, "receive.relabel-config", "YAML file that contains relabeling configuration.", extflag.WithEnvSubstitution())
 
 	rc.tsdbMinBlockDuration = extkingpin.ModelDuration(cmd.Flag("tsdb.min-block-duration", "Min duration for local TSDB blocks").Default("2h").Hidden())
 
 	rc.tsdbMaxBlockDuration = extkingpin.ModelDuration(cmd.Flag("tsdb.max-block-duration", "Max duration for local TSDB blocks").Default("2h").Hidden())
+
+	rc.tsdbTooFarInFutureTimeWindow = extkingpin.ModelDuration(cmd.Flag("tsdb.too-far-in-future.time-window",
+		"[EXPERIMENTAL] Configures the allowed time window for ingesting samples too far in the future. Disabled (0s) by default"+
+			"Please note enable this flag will reject samples in the future of receive local NTP time + configured duration due to clock skew in remote write clients.",
+	).Default("0s"))
 
 	rc.tsdbOutOfOrderTimeWindow = extkingpin.ModelDuration(cmd.Flag("tsdb.out-of-order.time-window",
 		"[EXPERIMENTAL] Configures the allowed time window for ingestion of out-of-order samples. Disabled (0s) by default"+
@@ -923,6 +971,8 @@ func (rc *receiveConfig) registerFlag(cmd extkingpin.FlagClause) {
 	rc.reqLogConfig = extkingpin.RegisterRequestLoggingFlags(cmd)
 
 	rc.writeLimitsConfig = extflag.RegisterPathOrContent(cmd, "receive.limits-config", "YAML file that contains limit configuration.", extflag.WithEnvSubstitution(), extflag.WithHidden())
+	cmd.Flag("receive.limits-config-reload-timer", "Minimum amount of time to pass for the limit configuration to be reloaded. Helps to avoid excessive reloads.").
+		Default("1s").Hidden().DurationVar(&rc.limitsConfigReloadTimer)
 }
 
 // determineMode returns the ReceiverMode that this receiver is configured to run in.

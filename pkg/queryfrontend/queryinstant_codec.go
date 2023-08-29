@@ -20,7 +20,6 @@ import (
 	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/prometheus/prometheus/promql/parser"
-	promqlparser "github.com/prometheus/prometheus/promql/parser"
 	"github.com/thanos-io/thanos/internal/cortex/cortexpb"
 	"github.com/thanos-io/thanos/internal/cortex/querier/queryrange"
 	cortexutil "github.com/thanos-io/thanos/internal/cortex/util"
@@ -54,6 +53,15 @@ func (c queryInstantCodec) MergeResponse(req queryrange.Request, responses ...qu
 	for _, resp := range responses {
 		promResponses = append(promResponses, resp.(*queryrange.PrometheusInstantQueryResponse))
 	}
+
+	var explanation *queryrange.Explanation
+	for i := range promResponses {
+		if promResponses[i].Data.GetExplanation() != nil {
+			explanation = promResponses[i].Data.GetExplanation()
+			break
+		}
+	}
+
 	var res queryrange.Response
 	switch promResponses[0].Data.ResultType {
 	case model.ValMatrix.String():
@@ -66,7 +74,8 @@ func (c queryInstantCodec) MergeResponse(req queryrange.Request, responses ...qu
 						Matrix: matrixMerge(promResponses),
 					},
 				},
-				Stats: queryrange.StatsMerge(responses),
+				Stats:       queryrange.StatsMerge(responses),
+				Explanation: explanation,
 			},
 		}
 	default:
@@ -83,7 +92,8 @@ func (c queryInstantCodec) MergeResponse(req queryrange.Request, responses ...qu
 						Vector: v,
 					},
 				},
-				Stats: queryrange.StatsMerge(responses),
+				Stats:       queryrange.StatsMerge(responses),
+				Explanation: explanation,
 			},
 		}
 	}
@@ -143,6 +153,8 @@ func (c queryInstantCodec) DecodeRequest(_ context.Context, r *http.Request, for
 
 	result.Query = r.FormValue("query")
 	result.Path = r.URL.Path
+	result.Explain = r.FormValue(queryv1.QueryExplainParam)
+	result.Engine = r.FormValue("engine")
 
 	for _, header := range forwardHeaders {
 		for h, hv := range r.Header {
@@ -164,6 +176,8 @@ func (c queryInstantCodec) EncodeRequest(ctx context.Context, r queryrange.Reque
 		"query":                      []string{thanosReq.Query},
 		queryv1.DedupParam:           []string{strconv.FormatBool(thanosReq.Dedup)},
 		queryv1.PartialResponseParam: []string{strconv.FormatBool(thanosReq.PartialResponse)},
+		queryv1.QueryExplainParam:    []string{thanosReq.Explain},
+		queryv1.EngineParam:          []string{thanosReq.Engine},
 		queryv1.ReplicaLabelsParam:   thanosReq.ReplicaLabels,
 	}
 
@@ -285,7 +299,7 @@ func vectorMerge(req queryrange.Request, resps []*queryrange.PrometheusInstantQu
 			if existingSample, ok := output[metric]; !ok {
 				output[metric] = s
 				metrics = append(metrics, metric) // Preserve the order of metric.
-			} else if existingSample.GetSample().TimestampMs < s.GetSample().TimestampMs {
+			} else if existingSample.Timestamp < s.Timestamp {
 				// Choose the latest sample if we see overlap.
 				output[metric] = s
 			}
@@ -324,9 +338,9 @@ func vectorMerge(req queryrange.Request, resps []*queryrange.PrometheusInstantQu
 		// Order is determined by vector
 		switch sortPlan {
 		case sortByValuesAsc:
-			return samples[i].s.Sample.Value < samples[j].s.Sample.Value
+			return samples[i].s.SampleValue < samples[j].s.SampleValue
 		case sortByValuesDesc:
-			return samples[i].s.Sample.Value > samples[j].s.Sample.Value
+			return samples[i].s.SampleValue > samples[j].s.SampleValue
 		}
 		return samples[i].metric < samples[j].metric
 	})
@@ -347,18 +361,18 @@ const (
 )
 
 func sortPlanForQuery(q string) (sortPlan, error) {
-	expr, err := promqlparser.ParseExpr(q)
+	expr, err := parser.ParseExpr(q)
 	if err != nil {
 		return 0, err
 	}
 	// Check if the root expression is topk or bottomk
 	if aggr, ok := expr.(*parser.AggregateExpr); ok {
-		if aggr.Op == promqlparser.TOPK || aggr.Op == promqlparser.BOTTOMK {
+		if aggr.Op == parser.TOPK || aggr.Op == parser.BOTTOMK {
 			return mergeOnly, nil
 		}
 	}
-	checkForSort := func(expr promqlparser.Expr) (sortAsc, sortDesc bool) {
-		if n, ok := expr.(*promqlparser.Call); ok {
+	checkForSort := func(expr parser.Expr) (sortAsc, sortDesc bool) {
+		if n, ok := expr.(*parser.Call); ok {
 			if n.Func != nil {
 				if n.Func.Name == "sort" {
 					sortAsc = true
