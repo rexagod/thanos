@@ -8,22 +8,22 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
-	"github.com/pkg/errors"
-	"github.com/prometheus/client_golang/prometheus"
-	"gopkg.in/yaml.v2"
-
 	"github.com/thanos-io/objstore"
 	"github.com/thanos-io/objstore/providers/azure"
 	"github.com/thanos-io/objstore/providers/bos"
 	"github.com/thanos-io/objstore/providers/cos"
 	"github.com/thanos-io/objstore/providers/filesystem"
 	"github.com/thanos-io/objstore/providers/gcs"
+	"github.com/thanos-io/objstore/providers/obs"
 	"github.com/thanos-io/objstore/providers/oci"
 	"github.com/thanos-io/objstore/providers/oss"
 	"github.com/thanos-io/objstore/providers/s3"
 	"github.com/thanos-io/objstore/providers/swift"
+
+	"github.com/go-kit/log"
+	"github.com/go-kit/log/level"
+	"github.com/pkg/errors"
+	"gopkg.in/yaml.v2"
 )
 
 type ObjProvider string
@@ -38,6 +38,7 @@ const (
 	ALIYUNOSS  ObjProvider = "ALIYUNOSS"
 	BOS        ObjProvider = "BOS"
 	OCI        ObjProvider = "OCI"
+	OBS        ObjProvider = "OBS"
 )
 
 type BucketConfig struct {
@@ -48,7 +49,7 @@ type BucketConfig struct {
 
 // NewBucket initializes and returns new object storage clients.
 // NOTE: confContentYaml can contain secrets.
-func NewBucket(logger log.Logger, confContentYaml []byte, reg prometheus.Registerer, component string) (objstore.InstrumentedBucket, error) {
+func NewBucket(logger log.Logger, confContentYaml []byte, component string) (objstore.Bucket, error) {
 	level.Info(logger).Log("msg", "loading bucket configuration")
 	bucketConf := &BucketConfig{}
 	if err := yaml.UnmarshalStrict(confContentYaml, bucketConf); err != nil {
@@ -80,6 +81,8 @@ func NewBucket(logger log.Logger, confContentYaml []byte, reg prometheus.Registe
 		bucket, err = bos.NewBucket(logger, config, component)
 	case string(OCI):
 		bucket, err = oci.NewBucket(logger, config)
+	case string(OBS):
+		bucket, err = obs.NewBucket(logger, config)
 	default:
 		return nil, errors.Errorf("bucket with type %s is not supported", bucketConf.Type)
 	}
@@ -87,5 +90,5 @@ func NewBucket(logger log.Logger, confContentYaml []byte, reg prometheus.Registe
 		return nil, errors.Wrap(err, fmt.Sprintf("create %s client", bucketConf.Type))
 	}
 
-	return objstore.NewTracingBucket(objstore.BucketWithMetrics(bucket.Name(), objstore.NewPrefixedBucket(bucket, bucketConf.Prefix), reg)), nil
+	return objstore.NewPrefixedBucket(bucket, bucketConf.Prefix), nil
 }

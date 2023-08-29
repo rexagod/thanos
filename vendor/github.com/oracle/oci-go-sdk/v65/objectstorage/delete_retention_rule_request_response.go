@@ -1,4 +1,4 @@
-// Copyright (c) 2016, 2018, 2022, Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, 2023, Oracle and/or its affiliates.  All rights reserved.
 // This software is dual-licensed to you under the Universal Permissive License (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl or Apache License 2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose either license.
 // Code generated. DO NOT EDIT.
 
@@ -13,7 +13,7 @@ import (
 
 // DeleteRetentionRuleRequest wrapper for the DeleteRetentionRule operation
 //
-// See also
+// # See also
 //
 // Click https://docs.cloud.oracle.com/en-us/iaas/tools/go-sdk-examples/latest/objectstorage/DeleteRetentionRule.go.html to see an example of how to use DeleteRetentionRuleRequest.
 type DeleteRetentionRuleRequest struct {
@@ -60,6 +60,41 @@ func (request DeleteRetentionRuleRequest) BinaryRequestBody() (*common.OCIReadSe
 
 	return nil, false
 
+}
+
+// ReplaceMandatoryParamInPath replaces the mandatory parameter in the path with the value provided.
+// Not all services are supporting this feature and this method will be a no-op for those services.
+func (request DeleteRetentionRuleRequest) ReplaceMandatoryParamInPath(client *common.BaseClient, mandatoryParamMap map[string][]common.TemplateParamForPerRealmEndpoint) {
+	if mandatoryParamMap["namespaceName"] != nil {
+		templateParam := mandatoryParamMap["namespaceName"]
+		for _, template := range templateParam {
+			replacementParam := *request.NamespaceName
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
+	if mandatoryParamMap["bucketName"] != nil {
+		templateParam := mandatoryParamMap["bucketName"]
+		for _, template := range templateParam {
+			replacementParam := *request.BucketName
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
+	if mandatoryParamMap["retentionRuleId"] != nil {
+		templateParam := mandatoryParamMap["retentionRuleId"]
+		for _, template := range templateParam {
+			replacementParam := *request.RetentionRuleId
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
 }
 
 // RetryPolicy implements the OCIRetryableRequest interface. This retrieves the specified retry policy.

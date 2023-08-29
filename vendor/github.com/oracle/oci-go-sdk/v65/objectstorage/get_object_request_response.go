@@ -1,4 +1,4 @@
-// Copyright (c) 2016, 2018, 2022, Oracle and/or its affiliates.  All rights reserved.
+// Copyright (c) 2016, 2018, 2023, Oracle and/or its affiliates.  All rights reserved.
 // This software is dual-licensed to you under the Universal Permissive License (UPL) 1.0 as shown at https://oss.oracle.com/licenses/upl or Apache License 2.0 as shown at http://www.apache.org/licenses/LICENSE-2.0. You may choose either license.
 // Code generated. DO NOT EDIT.
 
@@ -14,7 +14,7 @@ import (
 
 // GetObjectRequest wrapper for the GetObject operation
 //
-// See also
+// # See also
 //
 // Click https://docs.cloud.oracle.com/en-us/iaas/tools/go-sdk-examples/latest/objectstorage/GetObject.go.html to see an example of how to use GetObjectRequest.
 type GetObjectRequest struct {
@@ -108,6 +108,41 @@ func (request GetObjectRequest) BinaryRequestBody() (*common.OCIReadSeekCloser, 
 
 }
 
+// ReplaceMandatoryParamInPath replaces the mandatory parameter in the path with the value provided.
+// Not all services are supporting this feature and this method will be a no-op for those services.
+func (request GetObjectRequest) ReplaceMandatoryParamInPath(client *common.BaseClient, mandatoryParamMap map[string][]common.TemplateParamForPerRealmEndpoint) {
+	if mandatoryParamMap["namespaceName"] != nil {
+		templateParam := mandatoryParamMap["namespaceName"]
+		for _, template := range templateParam {
+			replacementParam := *request.NamespaceName
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
+	if mandatoryParamMap["bucketName"] != nil {
+		templateParam := mandatoryParamMap["bucketName"]
+		for _, template := range templateParam {
+			replacementParam := *request.BucketName
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
+	if mandatoryParamMap["objectName"] != nil {
+		templateParam := mandatoryParamMap["objectName"]
+		for _, template := range templateParam {
+			replacementParam := *request.ObjectName
+			if template.EndsWithDot {
+				replacementParam = replacementParam + "."
+			}
+			client.Host = strings.Replace(client.Host, template.Template, replacementParam, -1)
+		}
+	}
+}
+
 // RetryPolicy implements the OCIRetryableRequest interface. This retrieves the specified retry policy.
 func (request GetObjectRequest) RetryPolicy() *common.RetryPolicy {
 	return request.RequestMetadata.RetryPolicy
@@ -190,7 +225,7 @@ type GetObjectResponse struct {
 	// Time that the object is returned to the archived state. This field is only present for restored objects.
 	TimeOfArchival *common.SDKTime `presentIn:"header" name:"time-of-archival"`
 
-	// VersionId of the object requested
+	// VersionId of the object
 	VersionId *string `presentIn:"header" name:"version-id"`
 
 	// The date and time after which the object is no longer cached by a browser, proxy, or other caching entity. See
