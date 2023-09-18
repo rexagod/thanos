@@ -98,6 +98,9 @@ const (
 
 	// Storage class header.
 	amzStorageClass = "X-Amz-Storage-Class"
+
+	// amzKmsKeyAccessDeniedErrorMessage is the error message returned by s3 when the permissions to the KMS key is revoked.
+	amzKmsKeyAccessDeniedErrorMessage = "The ciphertext refers to a customer master key that does not exist, does not exist in this region, or you are not allowed to access."
 )
 
 var DefaultConfig = Config{
@@ -130,6 +133,7 @@ type Config struct {
 	Insecure           bool               `yaml:"insecure"`
 	SignatureV2        bool               `yaml:"signature_version2"`
 	SecretKey          string             `yaml:"secret_key"`
+	SessionToken       string             `yaml:"session_token"`
 	PutUserMetadata    map[string]string  `yaml:"put_user_metadata"`
 	HTTPConfig         exthttp.HTTPConfig `yaml:"http_config"`
 	TraceConfig        TraceConfig        `yaml:"trace"`
@@ -143,7 +147,7 @@ type Config struct {
 }
 
 // SSEConfig deals with the configuration of SSE for Minio. The following options are valid:
-// kmsencryptioncontext == https://docs.aws.amazon.com/kms/latest/developerguide/services-s3.html#s3-encryption-context
+// KMSEncryptionContext == https://docs.aws.amazon.com/kms/latest/developerguide/services-s3.html#s3-encryption-context
 type SSEConfig struct {
 	Type                 string            `yaml:"type"`
 	KMSKeyID             string            `yaml:"kms_key_id"`
@@ -228,6 +232,7 @@ func NewBucketWithConfig(logger log.Logger, config Config, component string) (*B
 			Value: credentials.Value{
 				AccessKeyID:     config.AccessKey,
 				SecretAccessKey: config.SecretKey,
+				SessionToken:    config.SessionToken,
 				SignerType:      credentials.SignatureV4,
 			},
 		})}
@@ -413,7 +418,7 @@ func (b *Bucket) Iter(ctx context.Context, dir string, f func(string) error, opt
 		}
 	}
 
-	return nil
+	return ctx.Err()
 }
 
 func (b *Bucket) getRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
@@ -536,6 +541,12 @@ func (b *Bucket) IsObjNotFoundErr(err error) bool {
 	return minio.ToErrorResponse(errors.Cause(err)).Code == "NoSuchKey"
 }
 
+// IsCustomerManagedKeyError returns true if the permissions for key used to encrypt the object was revoked.
+func (b *Bucket) IsCustomerManagedKeyError(err error) bool {
+	errResponse := minio.ToErrorResponse(errors.Cause(err))
+	return errResponse.Code == "AccessDenied" && errResponse.Message == amzKmsKeyAccessDeniedErrorMessage
+}
+
 func (b *Bucket) Close() error { return nil }
 
 // getServerSideEncryption returns the SSE to use.
@@ -552,10 +563,11 @@ func (b *Bucket) getServerSideEncryption(ctx context.Context) (encrypt.ServerSid
 
 func configFromEnv() Config {
 	c := Config{
-		Bucket:    os.Getenv("S3_BUCKET"),
-		Endpoint:  os.Getenv("S3_ENDPOINT"),
-		AccessKey: os.Getenv("S3_ACCESS_KEY"),
-		SecretKey: os.Getenv("S3_SECRET_KEY"),
+		Bucket:       os.Getenv("S3_BUCKET"),
+		Endpoint:     os.Getenv("S3_ENDPOINT"),
+		AccessKey:    os.Getenv("S3_ACCESS_KEY"),
+		SecretKey:    os.Getenv("S3_SECRET_KEY"),
+		SessionToken: os.Getenv("S3_SESSION_TOKEN"),
 	}
 
 	c.Insecure, _ = strconv.ParseBool(os.Getenv("S3_INSECURE"))
