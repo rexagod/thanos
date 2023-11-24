@@ -529,7 +529,7 @@ func (sp *scrapePool) Sync(tgs []*targetgroup.Group) {
 			case nonEmpty:
 				all = append(all, t)
 			case !t.discoveredLabels.IsEmpty():
-				if sp.config.KeepDroppedTargets != 0 && uint(len(sp.droppedTargets)) < sp.config.KeepDroppedTargets {
+				if sp.config.KeepDroppedTargets == 0 || uint(len(sp.droppedTargets)) < sp.config.KeepDroppedTargets {
 					sp.droppedTargets = append(sp.droppedTargets, t)
 				}
 				sp.droppedTargetsCount++
@@ -732,8 +732,8 @@ func mutateSampleLabels(lset labels.Labels, target *Target, honor bool, rc []*re
 }
 
 func resolveConflictingExposedLabels(lb *labels.Builder, conflictingExposedLabels []labels.Label) {
-	slices.SortStableFunc(conflictingExposedLabels, func(a, b labels.Label) bool {
-		return len(a.Name) < len(b.Name)
+	slices.SortStableFunc(conflictingExposedLabels, func(a, b labels.Label) int {
+		return len(a.Name) - len(b.Name)
 	})
 
 	for _, l := range conflictingExposedLabels {

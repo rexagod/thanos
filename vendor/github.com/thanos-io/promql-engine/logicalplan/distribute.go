@@ -12,8 +12,10 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 
+	"github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser/posrange"
+
 	"github.com/thanos-io/promql-engine/api"
-	"github.com/thanos-io/promql-engine/parser"
 	"github.com/thanos-io/promql-engine/query"
 )
 
@@ -86,7 +88,7 @@ func (r RemoteExecution) String() string {
 
 func (r RemoteExecution) Pretty(level int) string { return r.String() }
 
-func (r RemoteExecution) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r RemoteExecution) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r RemoteExecution) Type() parser.ValueType { return parser.ValueTypeMatrix }
 
@@ -103,7 +105,7 @@ func (r Deduplicate) String() string {
 
 func (r Deduplicate) Pretty(level int) string { return r.String() }
 
-func (r Deduplicate) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r Deduplicate) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r Deduplicate) Type() parser.ValueType { return parser.ValueTypeMatrix }
 
@@ -115,7 +117,7 @@ func (r Noop) String() string { return "noop" }
 
 func (r Noop) Pretty(level int) string { return r.String() }
 
-func (r Noop) PositionRange() parser.PositionRange { return parser.PositionRange{} }
+func (r Noop) PositionRange() posrange.PositionRange { return posrange.PositionRange{} }
 
 func (r Noop) Type() parser.ValueType { return parser.ValueTypeMatrix }
 
@@ -127,6 +129,7 @@ var distributiveAggregations = map[parser.ItemType]struct{}{
 	parser.SUM:     {},
 	parser.MIN:     {},
 	parser.MAX:     {},
+	parser.AVG:     {},
 	parser.GROUP:   {},
 	parser.COUNT:   {},
 	parser.BOTTOMK: {},
@@ -365,14 +368,13 @@ func calculateStartOffset(expr *parser.Expr, lookbackDelta time.Duration) time.D
 
 	var selectRange time.Duration
 	var offset time.Duration
-	parser.Inspect(*expr, func(node parser.Node, nodes []parser.Node) error {
-		if matrixSelector, ok := node.(*parser.MatrixSelector); ok {
+	traverse(expr, func(node *parser.Expr) {
+		if matrixSelector, ok := (*node).(*parser.MatrixSelector); ok {
 			selectRange = matrixSelector.Range
 		}
-		if vectorSelector, ok := node.(*parser.VectorSelector); ok {
+		if vectorSelector, ok := (*node).(*parser.VectorSelector); ok {
 			offset = vectorSelector.Offset
 		}
-		return nil
 	})
 	return maxDuration(offset+selectRange, lookbackDelta)
 }
@@ -412,7 +414,14 @@ func matchesExternalLabelSet(expr parser.Expr, externalLabelSet []labels.Labels)
 	if len(externalLabelSet) == 0 {
 		return true
 	}
-	selectorSet := parser.ExtractSelectors(expr)
+	var selectorSet [][]*labels.Matcher
+	traverse(&expr, func(current *parser.Expr) {
+		vs, ok := (*current).(*parser.VectorSelector)
+		if ok {
+			selectorSet = append(selectorSet, vs.LabelMatchers)
+		}
+	})
+
 	for _, selectors := range selectorSet {
 		hasMatch := false
 		for _, externalLabels := range externalLabelSet {

@@ -20,19 +20,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
-	promparser "github.com/prometheus/prometheus/promql/parser"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/util/stats"
 	v1 "github.com/prometheus/prometheus/web/api/v1"
 
 	"github.com/thanos-io/promql-engine/api"
 	"github.com/thanos-io/promql-engine/execution"
+	"github.com/thanos-io/promql-engine/execution/function"
 	"github.com/thanos-io/promql-engine/execution/model"
 	"github.com/thanos-io/promql-engine/execution/parse"
 	"github.com/thanos-io/promql-engine/execution/warnings"
 	"github.com/thanos-io/promql-engine/extlabels"
 	"github.com/thanos-io/promql-engine/logicalplan"
-	"github.com/thanos-io/promql-engine/parser"
 	"github.com/thanos-io/promql-engine/query"
 )
 
@@ -83,6 +83,9 @@ type Opts struct {
 
 	// EnableAnalysis enables query analysis.
 	EnableAnalysis bool
+
+	// SelectorBatchSize specifies the maximum number of samples to be returned by selectors in a single batch.
+	SelectorBatchSize int64
 }
 
 func (o Opts) getLogicalOptimizers() []logicalplan.Optimizer {
@@ -139,6 +142,7 @@ type distributedEngine struct {
 func NewDistributedEngine(opts Opts, endpoints api.RemoteEndpoints) v1.QueryEngine {
 	opts.LogicalOptimizers = []logicalplan.Optimizer{
 		logicalplan.PassthroughOptimizer{Endpoints: endpoints},
+		logicalplan.DistributeAvgOptimizer{},
 		logicalplan.DistributedExecutionOptimizer{Endpoints: endpoints},
 	}
 
@@ -180,11 +184,21 @@ func New(opts Opts) *compatibilityEngine {
 		opts.ExtLookbackDelta = 1 * time.Hour
 		level.Debug(opts.Logger).Log("msg", "externallookback delta is zero, setting to default value", "value", 1*24*time.Hour)
 	}
+	if opts.SelectorBatchSize != 0 {
+		opts.LogicalOptimizers = append(
+			[]logicalplan.Optimizer{logicalplan.SelectorBatchSize{Size: opts.SelectorBatchSize}},
+			opts.LogicalOptimizers...,
+		)
+	}
 
+	functions := make(map[string]*parser.Function, len(parser.Functions))
+	for k, v := range parser.Functions {
+		functions[k] = v
+	}
 	if opts.EnableXFunctions {
-		parser.Functions["xdelta"] = parse.XFunctions["xdelta"]
-		parser.Functions["xincrease"] = parse.XFunctions["xincrease"]
-		parser.Functions["xrate"] = parse.XFunctions["xrate"]
+		functions["xdelta"] = function.XFunctions["xdelta"]
+		functions["xincrease"] = function.XFunctions["xincrease"]
+		functions["xrate"] = function.XFunctions["xrate"]
 	}
 
 	metrics := &engineMetrics{
@@ -214,7 +228,8 @@ func New(opts Opts) *compatibilityEngine {
 	}
 
 	return &compatibilityEngine{
-		prom: engine,
+		prom:      engine,
+		functions: functions,
 
 		debugWriter:       opts.DebugWriter,
 		disableFallback:   opts.DisableFallback,
@@ -233,7 +248,8 @@ func New(opts Opts) *compatibilityEngine {
 }
 
 type compatibilityEngine struct {
-	prom v1.QueryEngine
+	prom      v1.QueryEngine
+	functions map[string]*parser.Function
 
 	debugWriter io.Writer
 
@@ -255,7 +271,7 @@ func (e *compatibilityEngine) SetQueryLogger(l promql.QueryLogger) {
 }
 
 func (e *compatibilityEngine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, ts time.Time) (promql.Query, error) {
-	expr, err := parser.ParseExpr(qs)
+	expr, err := parser.NewParser(qs, parser.WithFunctions(e.functions)).ParseExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -312,7 +328,7 @@ func (e *compatibilityEngine) NewInstantQuery(ctx context.Context, q storage.Que
 }
 
 func (e *compatibilityEngine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts promql.QueryOpts, qs string, start, end time.Time, step time.Duration) (promql.Query, error) {
-	expr, err := parser.ParseExpr(qs)
+	expr, err := parser.NewParser(qs, parser.WithFunctions(e.functions)).ParseExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -541,8 +557,7 @@ type compatibilityQuery struct {
 func (q *compatibilityQuery) Exec(ctx context.Context) (ret *promql.Result) {
 	ctx = warnings.NewContext(ctx)
 	defer func() {
-		warns := warnings.FromContext(ctx)
-		if len(warns) > 0 {
+		if warns := warnings.FromContext(ctx); len(warns) > 0 {
 			ret.Warnings = warns
 		}
 	}()
@@ -570,9 +585,6 @@ func (q *compatibilityQuery) Exec(ctx context.Context) (ret *promql.Result) {
 	resultSeries, err := q.Query.exec.Series(ctx)
 	if err != nil {
 		return newErrResult(ret, err)
-	}
-	if extlabels.ContainsDuplicateLabelSet(resultSeries) {
-		return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
 	}
 
 	series := make([]promql.Series, len(resultSeries))
@@ -634,6 +646,9 @@ loop:
 			resultMatrix = append(resultMatrix, s)
 		}
 		sort.Sort(resultMatrix)
+		if resultMatrix.ContainsSameLabelset() {
+			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
+		}
 		ret.Value = resultMatrix
 		if q.debugWriter != nil {
 			analyze(q.debugWriter, q.exec.(model.ObservableVectorOperator), "", "")
@@ -641,10 +656,14 @@ loop:
 		return ret
 	}
 
-	var result promparser.Value
+	var result parser.Value
 	switch q.expr.Type() {
 	case parser.ValueTypeMatrix:
-		result = promql.Matrix(series)
+		matrix := promql.Matrix(series)
+		if matrix.ContainsSameLabelset() {
+			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
+		}
+		result = matrix
 	case parser.ValueTypeVector:
 		// Convert matrix with one value per series into vector.
 		vector := make(promql.Vector, 0, len(resultSeries))
@@ -669,6 +688,9 @@ loop:
 			}
 		}
 		sort.Slice(vector, q.resultSort.comparer(&vector))
+		if vector.ContainsSameLabelset() {
+			return newErrResult(ret, extlabels.ErrDuplicateLabelSet)
+		}
 		result = vector
 	case parser.ValueTypeScalar:
 		v := math.NaN()
@@ -694,7 +716,7 @@ func newErrResult(r *promql.Result, err error) *promql.Result {
 	return r
 }
 
-func (q *compatibilityQuery) Statement() promparser.Statement { return nil }
+func (q *compatibilityQuery) Statement() parser.Statement { return nil }
 
 // Stats always returns empty query stats for now to avoid panic.
 func (q *compatibilityQuery) Stats() *stats.Statistics {
